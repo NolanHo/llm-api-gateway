@@ -69,6 +69,12 @@ func New(ctx context.Context, cfg config.Config, logger *zap.Logger) (*App, erro
 		client:    &http.Client{Timeout: cfg.UpstreamTimeout},
 		hasher:    security.NewCarrierHasher(cfg.CarrierHMACKey),
 	}
+	if err := a.registerRuntimeMetrics(); err != nil {
+		_ = duckStore.Close(ctx)
+		_ = sqliteStore.Close(ctx)
+		_ = telemetry.Close(ctx)
+		return nil, fmt.Errorf("register runtime metrics: %w", err)
+	}
 	a.routes()
 	logger.Info("storage initialized",
 		logging.String("sqlite_path", cfg.SQLitePath),
@@ -113,9 +119,9 @@ func (a *App) routes() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ready"}`))
 	})
-	a.mux.Handle("/metrics", a.telemetry.Handler)
+	a.mux.Handle("/metrics", a.withAccess(a.telemetry.Handler.ServeHTTP))
 	a.registerAdminRoutes()
-	a.mux.HandleFunc("/v1/responses", a.handleResponses)
+	a.mux.HandleFunc("/v1/responses", a.withAccess(a.handleResponses))
 }
 
 func (a *App) Handler() http.Handler { return a.mux }

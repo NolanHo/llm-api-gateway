@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,6 +23,7 @@ import (
 type fakeDownstream struct {
 	mu       sync.Mutex
 	requests []map[string]any
+	headers  []http.Header
 	name     string
 	host     string
 	port     int
@@ -36,6 +38,7 @@ func newFakeDownstream(t *testing.T, name string) *fakeDownstream {
 		_ = json.NewDecoder(r.Body).Decode(&raw)
 		fd.mu.Lock()
 		fd.requests = append(fd.requests, raw)
+		fd.headers = append(fd.headers, r.Header.Clone())
 		fd.mu.Unlock()
 		if stream, _ := raw["stream"].(bool); stream {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -71,6 +74,16 @@ func (f *fakeDownstream) Requests() []map[string]any {
 	defer f.mu.Unlock()
 	out := make([]map[string]any, len(f.requests))
 	copy(out, f.requests)
+	return out
+}
+
+func (f *fakeDownstream) Headers() []http.Header {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]http.Header, len(f.headers))
+	for i := range f.headers {
+		out[i] = f.headers[i].Clone()
+	}
 	return out
 }
 
@@ -149,6 +162,72 @@ func TestResponsesE2EAndAdmin(t *testing.T) {
 	}
 }
 
+func TestAccessTokenProtectsGatewayRoutes(t *testing.T) {
+	ctx := context.Background()
+	ds := newFakeDownstream(t, "a")
+	defer ds.Close()
+	cfg := testConfig(t, []sqlitestore.Account{accountFromDownstream("acc_a", ds)})
+	cfg.AccessToken = "test-token"
+	logger, err := logging.New(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = logger.Sync() }()
+	app, err := New(ctx, cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = app.Close(ctx) }()
+	gateway := httptest.NewServer(app.Handler())
+	defer gateway.Close()
+
+	resp, err := gateway.Client().Get(gateway.URL + "/admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized admin response, got %d", resp.StatusCode)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, gateway.URL+"/admin/api/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+	resp, err = gateway.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected authorized metrics response, got %d", resp.StatusCode)
+	}
+
+	body := map[string]any{"model": "gpt-5.4-mini", "input": []map[string]any{{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "hello"}}}}}
+	_ = doJSONWithBearer(t, gateway.Client(), gateway.URL+"/v1/responses", "test-token", body)
+	if got := ds.Headers()[0].Get("Authorization"); got != "" {
+		t.Fatalf("gateway auth header leaked downstream: %q", got)
+	}
+	metricsReq, err := http.NewRequest(http.MethodGet, gateway.URL+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsReq.Header.Set("Authorization", "Bearer test-token")
+	resp, err = gateway.Client().Do(metricsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	metricsBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(metricsBody), "gateway_active_sessions") || !strings.Contains(string(metricsBody), "gateway_recent_turns") {
+		t.Fatalf("missing runtime gauges in /metrics: %s", string(metricsBody))
+	}
+}
+
 func doJSON(t *testing.T, c *http.Client, url string, payload any) map[string]any {
 	t.Helper()
 	body, err := json.Marshal(payload)
@@ -156,6 +235,35 @@ func doJSON(t *testing.T, c *http.Client, url string, payload any) map[string]an
 		t.Fatal(err)
 	}
 	resp, err := c.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var failure map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&failure)
+		t.Fatalf("request failed: status=%d body=%v", resp.StatusCode, failure)
+	}
+	var raw map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func doJSONWithBearer(t *testing.T, c *http.Client, url string, token string, payload any) map[string]any {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

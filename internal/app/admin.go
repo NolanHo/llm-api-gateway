@@ -28,6 +28,10 @@ a:hover { text-decoration: underline; }
 <h1>llm-api-gateway admin</h1>
 <p>Use <code>?lineage=lin_...</code> to inspect one lineage.</p>
 <section>
+  <h2>Monitoring</h2>
+  <div id="monitoring"></div>
+</section>
+<section>
   <h2>Accounts</h2>
   <div id="accounts"></div>
 </section>
@@ -61,7 +65,25 @@ function formatCell(key, value) {
   if (key === 'lineage_session_id' && value) return '<a href="?lineage=' + encodeURIComponent(value) + '">' + value + '</a>';
   return value === null || value === undefined || value === '' ? '' : String(value);
 }
+function renderMonitoring(snapshot) {
+  const global = snapshot.global || {};
+  const accounts = (snapshot.accounts || []).map(a => ({
+    account_id: a.account_id,
+    active_sessions: a.active_sessions,
+    active_carriers: a.active_carriers,
+    recent_replays: a.recent_replays,
+    recent_turns: a.recent_turns,
+    recent_failures: a.recent_failures,
+    route_modes: a.route_modes,
+    carrier_kinds: a.carrier_kinds,
+    replay_reasons: a.replay_reasons,
+    failure_reasons: a.failure_reasons
+  }));
+  return '<h3>Global</h3>' + renderTable([global]) + '<h3>By account</h3>' + renderTable(accounts);
+}
 async function main() {
+  const monitoring = await fetchJSON('/admin/api/metrics');
+  document.getElementById('monitoring').innerHTML = renderMonitoring(monitoring);
   const accounts = await fetchJSON('/admin/api/accounts');
   document.getElementById('accounts').innerHTML = renderTable(accounts.accounts || []);
   const events = await fetchJSON('/admin/api/events?limit=20');
@@ -89,12 +111,13 @@ main().catch(err => {
 </html>`
 
 func (a *App) registerAdminRoutes() {
-	a.mux.HandleFunc("/admin", a.handleAdminUI)
-	a.mux.HandleFunc("/admin/", a.handleAdminUI)
-	a.mux.HandleFunc("/admin/api/accounts", a.handleAdminAccounts)
-	a.mux.HandleFunc("/admin/api/accounts/", a.handleAdminAccountOverview)
-	a.mux.HandleFunc("/admin/api/lineages/", a.handleAdminLineage)
-	a.mux.HandleFunc("/admin/api/events", a.handleAdminEvents)
+	a.mux.HandleFunc("/admin", a.withAccess(a.handleAdminUI))
+	a.mux.HandleFunc("/admin/", a.withAccess(a.handleAdminUI))
+	a.mux.HandleFunc("/admin/api/accounts", a.withAccess(a.handleAdminAccounts))
+	a.mux.HandleFunc("/admin/api/accounts/", a.withAccess(a.handleAdminAccountOverview))
+	a.mux.HandleFunc("/admin/api/metrics", a.withAccess(a.handleAdminMetrics))
+	a.mux.HandleFunc("/admin/api/lineages/", a.withAccess(a.handleAdminLineage))
+	a.mux.HandleFunc("/admin/api/events", a.withAccess(a.handleAdminEvents))
 }
 
 func (a *App) handleAdminUI(w http.ResponseWriter, r *http.Request) {
@@ -103,7 +126,7 @@ func (a *App) handleAdminUI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
-	accounts, err := a.sqlite.ListAccountOverviews(r.Context(), time.Now().UTC(), 24*time.Hour)
+	accounts, err := a.sqlite.ListAccountOverviews(r.Context(), time.Now().UTC(), metricsLookback)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "admin_query_failed", err.Error())
 		return
@@ -117,12 +140,21 @@ func (a *App) handleAdminAccountOverview(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, http.StatusBadRequest, "invalid_account_id", "missing account id")
 		return
 	}
-	overview, err := a.sqlite.GetAccountOverview(r.Context(), accountID, time.Now().UTC(), 24*time.Hour, 20)
+	overview, err := a.sqlite.GetAccountOverview(r.Context(), accountID, time.Now().UTC(), metricsLookback, 20)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "admin_query_failed", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, overview)
+}
+
+func (a *App) handleAdminMetrics(w http.ResponseWriter, r *http.Request) {
+	snapshot, err := a.sqlite.MonitoringSnapshot(r.Context(), time.Now().UTC(), metricsLookback)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "admin_query_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
 }
 
 func (a *App) handleAdminLineage(w http.ResponseWriter, r *http.Request) {

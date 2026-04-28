@@ -374,7 +374,7 @@ func mustParseMap(body []byte) map[string]any {
 func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		switch http.CanonicalHeaderKey(k) {
-		case "Connection", "Proxy-Connection", "Keep-Alive", "Transfer-Encoding", "Upgrade", "Host", "Content-Length":
+		case "Connection", "Proxy-Connection", "Keep-Alive", "Transfer-Encoding", "Upgrade", "Host", "Content-Length", "Authorization", "Cookie", "X-Llm-Gateway-Token":
 			continue
 		}
 		for _, v := range vs {

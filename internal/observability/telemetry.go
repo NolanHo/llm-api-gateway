@@ -27,13 +27,47 @@ type Telemetry struct {
 }
 
 type Metrics struct {
-	UpstreamRequests metric.Int64Counter
-	UpstreamFailures metric.Int64Counter
-	ReplayTotal      metric.Int64Counter
-	CarrierWrites    metric.Int64Counter
-	ArchiveFailures  metric.Int64Counter
-	UpstreamDuration metric.Float64Histogram
-	ArchiveDuration  metric.Float64Histogram
+	UpstreamRequests      metric.Int64Counter
+	UpstreamFailures      metric.Int64Counter
+	ReplayTotal           metric.Int64Counter
+	CarrierWrites         metric.Int64Counter
+	ArchiveFailures       metric.Int64Counter
+	UpstreamDuration      metric.Float64Histogram
+	ArchiveDuration       metric.Float64Histogram
+	EnabledAccounts       metric.Int64ObservableGauge
+	RetainedLineages      metric.Int64ObservableGauge
+	LineageBindings       metric.Int64ObservableGauge
+	ActiveSessions        metric.Int64ObservableGauge
+	ActiveCarriers        metric.Int64ObservableGauge
+	RecentReplays         metric.Int64ObservableGauge
+	RecentTurns           metric.Int64ObservableGauge
+	RecentRoutingFailures metric.Int64ObservableGauge
+	runtimeGaugeCallback  metric.Registration
+}
+
+func (m *Metrics) RegisterRuntimeGauges(meter metric.Meter, callback metric.Callback) error {
+	registration, err := meter.RegisterCallback(callback,
+		m.EnabledAccounts,
+		m.RetainedLineages,
+		m.LineageBindings,
+		m.ActiveSessions,
+		m.ActiveCarriers,
+		m.RecentReplays,
+		m.RecentTurns,
+		m.RecentRoutingFailures,
+	)
+	if err != nil {
+		return err
+	}
+	m.runtimeGaugeCallback = registration
+	return nil
+}
+
+func (m *Metrics) Close() error {
+	if m == nil || m.runtimeGaugeCallback == nil {
+		return nil
+	}
+	return m.runtimeGaugeCallback.Unregister()
 }
 
 func Init(ctx context.Context, serviceName string, traceStdout bool) (*Telemetry, error) {
@@ -111,11 +145,67 @@ func newMetrics(meter metric.Meter) (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Metrics{upstreamRequests, upstreamFailures, replayTotal, carrierWrites, archiveFailures, upstreamDuration, archiveDuration}, nil
+	enabledAccounts, err := meter.Int64ObservableGauge("gateway_enabled_accounts")
+	if err != nil {
+		return nil, err
+	}
+	retainedLineages, err := meter.Int64ObservableGauge("gateway_retained_lineages")
+	if err != nil {
+		return nil, err
+	}
+	lineageBindings, err := meter.Int64ObservableGauge("gateway_lineage_bindings")
+	if err != nil {
+		return nil, err
+	}
+	activeSessions, err := meter.Int64ObservableGauge("gateway_active_sessions")
+	if err != nil {
+		return nil, err
+	}
+	activeCarriers, err := meter.Int64ObservableGauge("gateway_active_carriers")
+	if err != nil {
+		return nil, err
+	}
+	recentReplays, err := meter.Int64ObservableGauge("gateway_recent_replays")
+	if err != nil {
+		return nil, err
+	}
+	recentTurns, err := meter.Int64ObservableGauge("gateway_recent_turns")
+	if err != nil {
+		return nil, err
+	}
+	recentRoutingFailures, err := meter.Int64ObservableGauge("gateway_recent_routing_failures")
+	if err != nil {
+		return nil, err
+	}
+	return &Metrics{
+		UpstreamRequests:      upstreamRequests,
+		UpstreamFailures:      upstreamFailures,
+		ReplayTotal:           replayTotal,
+		CarrierWrites:         carrierWrites,
+		ArchiveFailures:       archiveFailures,
+		UpstreamDuration:      upstreamDuration,
+		ArchiveDuration:       archiveDuration,
+		EnabledAccounts:       enabledAccounts,
+		RetainedLineages:      retainedLineages,
+		LineageBindings:       lineageBindings,
+		ActiveSessions:        activeSessions,
+		ActiveCarriers:        activeCarriers,
+		RecentReplays:         recentReplays,
+		RecentTurns:           recentTurns,
+		RecentRoutingFailures: recentRoutingFailures,
+	}, nil
 }
 
 func (t *Telemetry) Close(ctx context.Context) error {
-	if t == nil || t.closeFn == nil {
+	if t == nil {
+		return nil
+	}
+	if t.Metrics != nil {
+		if err := t.Metrics.Close(); err != nil {
+			return err
+		}
+	}
+	if t.closeFn == nil {
 		return nil
 	}
 	return t.closeFn(ctx)
@@ -126,6 +216,10 @@ func AddAttrs(kv ...attribute.KeyValue) metric.AddOption {
 }
 
 func RecordAttrs(kv ...attribute.KeyValue) metric.RecordOption {
+	return metric.WithAttributes(kv...)
+}
+
+func ObserveAttrs(kv ...attribute.KeyValue) metric.ObserveOption {
 	return metric.WithAttributes(kv...)
 }
 

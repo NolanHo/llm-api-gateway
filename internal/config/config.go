@@ -21,6 +21,7 @@ type Config struct {
 	InactiveSessionRetain time.Duration
 	DefaultReplayEnabled  bool
 	DefaultProviderKind   string
+	AccessToken           string
 }
 
 func Load() (Config, error) {
@@ -38,6 +39,7 @@ func Load() (Config, error) {
 		InactiveSessionRetain: getenvDuration("LLM_GATEWAY_SESSION_RETENTION", 14*24*time.Hour),
 		DefaultReplayEnabled:  getenvBool("LLM_GATEWAY_REPLAY_ENABLED", true),
 		DefaultProviderKind:   getenv("LLM_GATEWAY_PROVIDER_KIND", "copilot-api"),
+		AccessToken:           getenv("LLM_GATEWAY_ACCESS_TOKEN", ""),
 	}
 	if cfg.ActiveSessionWindow <= 0 {
 		return Config{}, fmt.Errorf("active session window must be positive")
