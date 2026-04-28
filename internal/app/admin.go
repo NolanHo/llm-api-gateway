@@ -70,6 +70,7 @@ h3 { margin: 16px 0 10px; font-size: 14px; }
 .button.small { height: 30px; padding: 0 10px; font-size: 12px; }
 .button.danger { border-color: var(--red-soft); color: var(--red); background: #fff7f7; }
 .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
+.probe-result { margin-top: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 12px; background: #f9fafb; color: #374151; font-size: 12px; }
 .grid { display: grid; gap: 16px; }
 .stat-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); margin-bottom: 16px; }
 .layout { grid-template-columns: minmax(0, 1.35fr) minmax(360px, .65fr); align-items: start; }
@@ -199,6 +200,7 @@ const icons = {
 };
 const qs = s => document.querySelector(s);
 const byId = id => document.getElementById(id);
+const probeResults = new Map();
 const arr = x => Array.isArray(x) ? x : [];
 const num = x => Number.isFinite(Number(x)) ? Number(x) : 0;
 const str = x => x === null || x === undefined ? '' : String(x);
@@ -333,8 +335,16 @@ function accountStateBadge(a) {
   return badge(a.state || 'running', 'ok');
 }
 function actionButtons(a) {
-  const toggle = a.enabled ? '<button class="button small danger" onclick="setAccountEnabled(\'' + escapeHTML(a.account_id) + '\', false)">Disable</button>' : '<button class="button small" onclick="setAccountEnabled(\'' + escapeHTML(a.account_id) + '\', true)">Enable</button>';
-  return '<div class="actions">' + toggle + '<button class="button small" onclick="probeAccount(\'' + escapeHTML(a.account_id) + '\')">Probe</button></div>';
+  const toggle = a.enabled ? '<button class="button small danger" data-action="disable" data-account-id="' + escapeHTML(a.account_id) + '">Disable</button>' : '<button class="button small" data-action="enable" data-account-id="' + escapeHTML(a.account_id) + '">Enable</button>';
+  return '<div class="actions">' + toggle + '<button class="button small" data-action="probe" data-account-id="' + escapeHTML(a.account_id) + '">Probe</button></div>';
+}
+function renderProbeResult(accountID) {
+  const result = probeResults.get(accountID);
+  if (!result) return '';
+  const status = result.status_code || 'error';
+  const tone = result.ok ? 'ok' : 'bad';
+  const body = result.error ? result.error : (result.body_snippet || '');
+  return '<div class="probe-result">' + badge('probe ' + status, tone) + ' latency=' + fmt(result.latency_ms) + 'ms target=' + escapeHTML(result.target || '') + (body ? '<pre>' + escapeHTML(body) + '</pre>' : '') + '</div>';
 }
 function renderAccounts(accounts) {
   if (!accounts.length) return '<div class="empty">empty</div>';
@@ -344,7 +354,7 @@ function renderAccounts(accounts) {
     const badges = renderLabelCounts(a.route_modes, 'route') + renderLabelCounts(a.carrier_kinds, 'carrier') + renderLabelCounts(a.replay_reasons, 'replay') + renderLabelCounts(a.failure_reasons, 'failure') + renderLabelCounts(a.status_codes, 'status') + recentTurns;
     return '<article class="account-card"><div class="account-top"><div><div class="account-name">' + escapeHTML(a.display_name) + '</div><div class="account-host">' + escapeHTML(a.account_id) + ' -> ' + escapeHTML(a.downstream_host) + ':' + escapeHTML(a.downstream_port) + '</div></div>' + status + '</div>' +
       '<div class="mini-stats"><div class="mini"><div class="mini-label">sessions</div><div class="mini-value">' + fmt(a.active_sessions) + '</div></div><div class="mini"><div class="mini-label">success 30m</div><div class="mini-value">' + fmt(a.recent_success_count) + '</div></div><div class="mini"><div class="mini-label">fail 30m</div><div class="mini-value">' + fmt(a.recent_failure_count) + '</div></div><div class="mini"><div class="mini-label">fail rate</div><div class="mini-value">' + fmt(Math.round(a.failure_rate * 100)) + '%</div></div><div class="mini"><div class="mini-label">429</div><div class="mini-value">' + fmt(statusCount(a, 429)) + '</div></div><div class="mini"><div class="mini-label">502</div><div class="mini-value">' + fmt(statusCount(a, 502)) + '</div></div><div class="mini"><div class="mini-label">503</div><div class="mini-value">' + fmt(statusCount(a, 503)) + '</div></div><div class="mini"><div class="mini-label">replay 30m</div><div class="mini-value">' + fmt(a.recent_30m_replays) + ' / ' + fmt(Math.round(a.replay_rate_30m * 100)) + '%</div></div></div>' +
-      '<div class="badges">' + badges + '</div>' + actionButtons(a) + '</article>';
+      '<div class="badges">' + badges + '</div>' + actionButtons(a) + renderProbeResult(a.account_id) + '</article>';
   }).join('') + '</div>';
 }
 function renderMonitoring(snapshot) {
@@ -378,8 +388,26 @@ async function setAccountEnabled(accountID, enabled) {
   await main();
 }
 async function probeAccount(accountID) {
+  probeResults.set(accountID, {ok: false, status_code: 'running', latency_ms: 0, target: '', body_snippet: ''});
+  await main();
   const result = await postJSON('/admin/api/accounts/' + encodeURIComponent(accountID) + '/probe');
-  alert(accountID + '\nstatus=' + (result.status_code || 'error') + '\nlatency_ms=' + result.latency_ms + '\nok=' + result.ok + (result.error ? '\nerror=' + result.error : ''));
+  probeResults.set(accountID, result);
+  await main();
+}
+async function handleAccountAction(event) {
+  const button = event.target.closest('button[data-action]');
+  if (!button) return;
+  const accountID = button.dataset.accountId;
+  const action = button.dataset.action;
+  button.disabled = true;
+  try {
+    if (action === 'enable') await setAccountEnabled(accountID, true);
+    if (action === 'disable') await setAccountEnabled(accountID, false);
+    if (action === 'probe') await probeAccount(accountID);
+  } catch (err) {
+    probeResults.set(accountID, {ok: false, status_code: 'error', latency_ms: 0, target: '', error: err && err.message ? err.message : String(err)});
+    await main();
+  }
 }
 async function renderLineage() {
   const lineage = new URLSearchParams(location.search).get('lineage');
@@ -416,6 +444,7 @@ async function main() {
   }
 }
 byId('refresh').addEventListener('click', main);
+byId('accounts').addEventListener('click', handleAccountAction);
 mountIcons();
 main();
 </script>
