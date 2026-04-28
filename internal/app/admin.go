@@ -1,7 +1,9 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -65,6 +67,9 @@ h3 { margin: 16px 0 10px; font-size: 14px; }
 .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
 .button { display: inline-flex; align-items: center; gap: 8px; height: 38px; padding: 0 14px; border: 1px solid var(--line); border-radius: 12px; color: #374151; background: white; cursor: pointer; font: inherit; }
 .button.primary { border-color: var(--blue); color: white; background: var(--blue); }
+.button.small { height: 30px; padding: 0 10px; font-size: 12px; }
+.button.danger { border-color: var(--red-soft); color: var(--red); background: #fff7f7; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
 .grid { display: grid; gap: 16px; }
 .stat-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); margin-bottom: 16px; }
 .layout { grid-template-columns: minmax(0, 1.35fr) minmax(360px, .65fr); align-items: start; }
@@ -257,8 +262,18 @@ function normalizeAccounts(metricsAccounts, overviewAccounts) {
       active_sessions: num(metrics.active_sessions ?? overview.active_session_count),
       active_carriers: num(metrics.active_carriers ?? overview.active_carrier_count),
       recent_replay_count: num(metrics.recent_replays ?? overview.recent_replay_count),
+      enabled: Boolean(metrics.enabled ?? overview.enabled),
+      state: str(metrics.state || overview.state),
+      cooldown_until_ms: num(metrics.cooldown_until_ms ?? overview.cooldown_until_ms),
+      cooldown_reason: str(metrics.cooldown_reason || overview.cooldown_reason),
       recent_turn_count: num(metrics.recent_turns),
       recent_failure_count: num(metrics.recent_failures),
+      recent_success_count: num(metrics.recent_successes),
+      failure_rate: num(metrics.failure_rate),
+      recent_30m_turns: num(metrics.recent_30m_turns),
+      recent_30m_replays: num(metrics.recent_30m_replays),
+      replay_rate_30m: num(metrics.replay_rate_30m),
+      status_codes: arr(metrics.status_codes),
       route_modes: arr(metrics.route_modes),
       carrier_kinds: arr(metrics.carrier_kinds),
       replay_reasons: arr(metrics.replay_reasons),
@@ -275,7 +290,10 @@ function renderStats(snapshot) {
     statCard('Active carriers', g.active_carriers, 'strict authority', 'link'),
     statCard('Recent replays', g.recent_replays, 'last 24h', 'replay'),
     statCard('Recent turns', g.recent_turns, 'last 24h', 'activity'),
-    statCard('Failures', g.recent_routing_failures, 'last 24h', 'alert')
+    statCard('Successes', g.recent_successes, 'last 30m', 'activity'),
+    statCard('Failures', g.recent_failures, 'last 30m', 'alert'),
+    statCard('Failure rate', Math.round(num(g.failure_rate) * 100), 'percent, last 30m', 'alert'),
+    statCard('Replay rate', Math.round(num(g.replay_rate_30m) * 100), 'percent, last 30m', 'replay')
   ].join('');
 }
 function loadScore(a) {
@@ -305,15 +323,28 @@ function renderLoad(accounts) {
       '</div><div class="load-score">' + badge('sessions ' + fmt(a.active_sessions), a.active_sessions > 0 ? 'warn' : '') + '</div></div>';
   }).join('') + '</div>';
 }
+function statusCount(a, code) {
+  const row = a.status_codes.find(x => String(x.label) === String(code));
+  return row ? num(row.count) : 0;
+}
+function accountStateBadge(a) {
+  if (!a.enabled) return badge('disabled', 'bad');
+  if (a.state === 'cooldown') return badge('cooldown ' + fmt(Math.max(0, a.cooldown_until_ms - Date.now()) / 1000) + 's', 'warn');
+  return badge(a.state || 'running', 'ok');
+}
+function actionButtons(a) {
+  const toggle = a.enabled ? '<button class="button small danger" onclick="setAccountEnabled(\'' + escapeHTML(a.account_id) + '\', false)">Disable</button>' : '<button class="button small" onclick="setAccountEnabled(\'' + escapeHTML(a.account_id) + '\', true)">Enable</button>';
+  return '<div class="actions">' + toggle + '<button class="button small" onclick="probeAccount(\'' + escapeHTML(a.account_id) + '\')">Probe</button></div>';
+}
 function renderAccounts(accounts) {
   if (!accounts.length) return '<div class="empty">empty</div>';
   return '<div class="account-grid">' + accounts.map(a => {
-    const status = a.recent_failure_count > 0 ? badge('failures ' + fmt(a.recent_failure_count), 'bad') : badge('no failures', 'ok');
+    const status = accountStateBadge(a);
     const recentTurns = a.recent_turn_items.slice(0, 4).map(t => '<a class="badge" href="?lineage=' + encodeURIComponent(t.lineage_session_id) + '">' + escapeHTML(t.route_mode) + ':' + escapeHTML(t.lineage_session_id) + '</a>').join('');
-    const badges = renderLabelCounts(a.route_modes, 'route') + renderLabelCounts(a.carrier_kinds, 'carrier') + renderLabelCounts(a.replay_reasons, 'replay') + renderLabelCounts(a.failure_reasons, 'failure') + recentTurns;
+    const badges = renderLabelCounts(a.route_modes, 'route') + renderLabelCounts(a.carrier_kinds, 'carrier') + renderLabelCounts(a.replay_reasons, 'replay') + renderLabelCounts(a.failure_reasons, 'failure') + renderLabelCounts(a.status_codes, 'status') + recentTurns;
     return '<article class="account-card"><div class="account-top"><div><div class="account-name">' + escapeHTML(a.display_name) + '</div><div class="account-host">' + escapeHTML(a.account_id) + ' -> ' + escapeHTML(a.downstream_host) + ':' + escapeHTML(a.downstream_port) + '</div></div>' + status + '</div>' +
-      '<div class="mini-stats"><div class="mini"><div class="mini-label">sessions</div><div class="mini-value">' + fmt(a.active_sessions) + '</div></div><div class="mini"><div class="mini-label">carriers</div><div class="mini-value">' + fmt(a.active_carriers) + '</div></div><div class="mini"><div class="mini-label">replays</div><div class="mini-value">' + fmt(a.recent_replay_count) + '</div></div><div class="mini"><div class="mini-label">turns</div><div class="mini-value">' + fmt(a.recent_turn_count) + '</div></div></div>' +
-      '<div class="badges">' + badges + '</div></article>';
+      '<div class="mini-stats"><div class="mini"><div class="mini-label">sessions</div><div class="mini-value">' + fmt(a.active_sessions) + '</div></div><div class="mini"><div class="mini-label">success 30m</div><div class="mini-value">' + fmt(a.recent_success_count) + '</div></div><div class="mini"><div class="mini-label">fail 30m</div><div class="mini-value">' + fmt(a.recent_failure_count) + '</div></div><div class="mini"><div class="mini-label">fail rate</div><div class="mini-value">' + fmt(Math.round(a.failure_rate * 100)) + '%</div></div><div class="mini"><div class="mini-label">429</div><div class="mini-value">' + fmt(statusCount(a, 429)) + '</div></div><div class="mini"><div class="mini-label">502</div><div class="mini-value">' + fmt(statusCount(a, 502)) + '</div></div><div class="mini"><div class="mini-label">503</div><div class="mini-value">' + fmt(statusCount(a, 503)) + '</div></div><div class="mini"><div class="mini-label">replay 30m</div><div class="mini-value">' + fmt(a.recent_30m_replays) + ' / ' + fmt(Math.round(a.replay_rate_30m * 100)) + '%</div></div></div>' +
+      '<div class="badges">' + badges + '</div>' + actionButtons(a) + '</article>';
   }).join('') + '</div>';
 }
 function renderMonitoring(snapshot) {
@@ -327,8 +358,28 @@ function renderMonitoring(snapshot) {
     active_carriers: g.active_carriers,
     recent_replays: g.recent_replays,
     recent_turns: g.recent_turns,
-    recent_routing_failures: g.recent_routing_failures
+    recent_routing_failures: g.recent_routing_failures,
+    recent_30m_turns: g.recent_30m_turns,
+    recent_30m_replays: g.recent_30m_replays,
+    replay_rate_30m: g.replay_rate_30m,
+    recent_successes: g.recent_successes,
+    recent_failures: g.recent_failures,
+    failure_rate: g.failure_rate
   }]);
+}
+async function postJSON(path) {
+  const res = await fetch(path, {method: 'POST'});
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(path + ': ' + res.status + ' ' + JSON.stringify(body));
+  return body;
+}
+async function setAccountEnabled(accountID, enabled) {
+  await postJSON('/admin/api/accounts/' + encodeURIComponent(accountID) + '/' + (enabled ? 'enable' : 'disable'));
+  await main();
+}
+async function probeAccount(accountID) {
+  const result = await postJSON('/admin/api/accounts/' + encodeURIComponent(accountID) + '/probe');
+  alert(accountID + '\nstatus=' + (result.status_code || 'error') + '\nlatency_ms=' + result.latency_ms + '\nok=' + result.ok + (result.error ? '\nerror=' + result.error : ''));
 }
 async function renderLineage() {
   const lineage = new URLSearchParams(location.search).get('lineage');
@@ -396,9 +447,28 @@ func (a *App) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleAdminAccountOverview(w http.ResponseWriter, r *http.Request) {
-	accountID := strings.TrimPrefix(r.URL.Path, "/admin/api/accounts/")
-	if accountID == "" {
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/api/accounts/"), "/")
+	if path == "" {
 		writeJSONError(w, http.StatusBadRequest, "invalid_account_id", "missing account id")
+		return
+	}
+	parts := strings.Split(path, "/")
+	accountID := parts[0]
+	if len(parts) > 1 {
+		if r.Method != http.MethodPost {
+			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "account actions require POST")
+			return
+		}
+		switch parts[1] {
+		case "disable":
+			a.handleAdminAccountDisable(w, r, accountID)
+		case "enable":
+			a.handleAdminAccountEnable(w, r, accountID)
+		case "probe":
+			a.handleAdminAccountProbe(w, r, accountID)
+		default:
+			writeJSONError(w, http.StatusNotFound, "unknown_account_action", parts[1])
+		}
 		return
 	}
 	overview, err := a.sqlite.GetAccountOverview(r.Context(), accountID, time.Now().UTC(), metricsLookback, 20)
@@ -407,6 +477,57 @@ func (a *App) handleAdminAccountOverview(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, overview)
+}
+
+func (a *App) handleAdminAccountDisable(w http.ResponseWriter, r *http.Request, accountID string) {
+	now := time.Now().UTC()
+	if err := a.sqlite.SetAccountEnabled(r.Context(), accountID, false, now); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "account_disable_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"account_id": accountID, "enabled": false, "state": "disabled"})
+}
+
+func (a *App) handleAdminAccountEnable(w http.ResponseWriter, r *http.Request, accountID string) {
+	now := time.Now().UTC()
+	if err := a.sqlite.SetAccountEnabled(r.Context(), accountID, true, now); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "account_enable_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"account_id": accountID, "enabled": true, "state": "running"})
+}
+
+func (a *App) handleAdminAccountProbe(w http.ResponseWriter, r *http.Request, accountID string) {
+	account, err := a.sqlite.GetAccount(r.Context(), accountID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "account_probe_failed", err.Error())
+		return
+	}
+	url := "http://" + account.DownstreamHost + ":" + strconv.Itoa(account.DownstreamPort) + "/"
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "account_probe_failed", err.Error())
+		return
+	}
+	start := time.Now()
+	resp, err := a.client.Do(req)
+	latencyMS := time.Since(start).Milliseconds()
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"account_id": accountID, "ok": false, "error": err.Error(), "latency_ms": latencyMS, "target": url})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"account_id":   accountID,
+		"ok":           resp.StatusCode >= 200 && resp.StatusCode < 500,
+		"status_code":  resp.StatusCode,
+		"latency_ms":   latencyMS,
+		"target":       url,
+		"body_snippet": string(body),
+	})
 }
 
 func (a *App) handleAdminMetrics(w http.ResponseWriter, r *http.Request) {

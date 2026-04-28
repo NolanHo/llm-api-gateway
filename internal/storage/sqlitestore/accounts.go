@@ -10,15 +10,17 @@ import (
 )
 
 type Account struct {
-	AccountID      string   `json:"account_id"`
-	ProviderKind   string   `json:"provider_kind"`
-	DisplayName    string   `json:"display_name"`
-	DownstreamHost string   `json:"downstream_host"`
-	DownstreamPort int      `json:"downstream_port"`
-	Enabled        bool     `json:"enabled"`
-	State          string   `json:"state"`
-	ModelAllowlist []string `json:"model_allowlist"`
-	Weight         int      `json:"weight"`
+	AccountID       string   `json:"account_id"`
+	ProviderKind    string   `json:"provider_kind"`
+	DisplayName     string   `json:"display_name"`
+	DownstreamHost  string   `json:"downstream_host"`
+	DownstreamPort  int      `json:"downstream_port"`
+	Enabled         bool     `json:"enabled"`
+	State           string   `json:"state"`
+	CooldownUntilMS int64    `json:"cooldown_until_ms"`
+	CooldownReason  string   `json:"cooldown_reason"`
+	ModelAllowlist  []string `json:"model_allowlist"`
+	Weight          int      `json:"weight"`
 }
 
 func (s *Store) UpsertAccounts(ctx context.Context, accounts []Account, now time.Time) error {
@@ -29,15 +31,13 @@ func (s *Store) UpsertAccounts(ctx context.Context, accounts []Account, now time
 	defer func() { _ = tx.Rollback() }()
 	stmt := `INSERT INTO accounts (
 		account_id, provider_kind, display_name, downstream_host, downstream_port,
-		enabled, state, model_allowlist_json, weight, created_at_ms, updated_at_ms
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		enabled, state, cooldown_until_ms, cooldown_reason, model_allowlist_json, weight, created_at_ms, updated_at_ms
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(account_id) DO UPDATE SET
 		provider_kind = excluded.provider_kind,
 		display_name = excluded.display_name,
 		downstream_host = excluded.downstream_host,
 		downstream_port = excluded.downstream_port,
-		enabled = excluded.enabled,
-		state = excluded.state,
 		model_allowlist_json = excluded.model_allowlist_json,
 		weight = excluded.weight,
 		updated_at_ms = excluded.updated_at_ms`
@@ -58,6 +58,8 @@ func (s *Store) UpsertAccounts(ctx context.Context, accounts []Account, now time
 			account.DownstreamPort,
 			boolToInt(account.Enabled),
 			defaultIfEmpty(account.State, "running"),
+			account.CooldownUntilMS,
+			account.CooldownReason,
 			string(allowlist),
 			weight,
 			now.UnixMilli(),
@@ -70,6 +72,9 @@ func (s *Store) UpsertAccounts(ctx context.Context, accounts []Account, now time
 }
 
 func (s *Store) SelectLeastActiveAccount(ctx context.Context, model string, now time.Time) (Account, error) {
+	if err := s.RefreshAccountCooldowns(ctx, now); err != nil {
+		return Account{}, err
+	}
 	if err := s.RefreshLineageStatuses(ctx, now); err != nil {
 		return Account{}, err
 	}
@@ -77,7 +82,7 @@ func (s *Store) SelectLeastActiveAccount(ctx context.Context, model string, now 
 	if err != nil {
 		return Account{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT account_id, provider_kind, display_name, downstream_host, downstream_port, enabled, state, model_allowlist_json, weight FROM accounts WHERE enabled = 1 AND state = 'running'`)
+	rows, err := s.db.QueryContext(ctx, `SELECT account_id, provider_kind, display_name, downstream_host, downstream_port, enabled, state, cooldown_until_ms, cooldown_reason, model_allowlist_json, weight FROM accounts WHERE enabled = 1 AND state = 'running'`)
 	if err != nil {
 		return Account{}, err
 	}
@@ -90,7 +95,7 @@ func (s *Store) SelectLeastActiveAccount(ctx context.Context, model string, now 
 		var a Account
 		var enabled int
 		var allowlistJSON string
-		if err := rows.Scan(&a.AccountID, &a.ProviderKind, &a.DisplayName, &a.DownstreamHost, &a.DownstreamPort, &enabled, &a.State, &allowlistJSON, &a.Weight); err != nil {
+		if err := rows.Scan(&a.AccountID, &a.ProviderKind, &a.DisplayName, &a.DownstreamHost, &a.DownstreamPort, &enabled, &a.State, &a.CooldownUntilMS, &a.CooldownReason, &allowlistJSON, &a.Weight); err != nil {
 			return Account{}, err
 		}
 		a.Enabled = enabled == 1

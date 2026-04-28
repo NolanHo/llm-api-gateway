@@ -162,6 +162,73 @@ func TestResponsesE2EAndAdmin(t *testing.T) {
 	}
 }
 
+func TestAccountDisableAndCooldown(t *testing.T) {
+	ctx := context.Background()
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+	}))
+	defer bad.Close()
+	good := newFakeDownstream(t, "good")
+	defer good.Close()
+	badHost, badPort := splitHostPort(bad.URL)
+	cfg := testConfig(t, []sqlitestore.Account{
+		{AccountID: "acc_bad", ProviderKind: "copilot-api", DisplayName: "bad", DownstreamHost: badHost, DownstreamPort: badPort, Enabled: true, State: "running"},
+		accountFromDownstream("acc_good", good),
+	})
+	logger, err := logging.New(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = logger.Sync() }()
+	app, err := New(ctx, cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = app.Close(ctx) }()
+	gateway := httptest.NewServer(app.Handler())
+	defer gateway.Close()
+
+	body := map[string]any{"model": "gpt-5.4-mini", "input": []map[string]any{{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "hello"}}}}}
+	if status := doJSONStatus(t, gateway.Client(), gateway.URL+"/v1/responses", body); status != http.StatusTooManyRequests {
+		t.Fatalf("expected first request to hit rate limited account, got %d", status)
+	}
+	_ = doJSON(t, gateway.Client(), gateway.URL+"/v1/responses", body)
+	if len(good.Requests()) != 1 {
+		t.Fatalf("expected cooldown to route next request to good account, got %d", len(good.Requests()))
+	}
+
+	req, err := http.NewRequest(http.MethodPost, gateway.URL+"/admin/api/accounts/acc_good/disable", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := gateway.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("disable failed: %d", resp.StatusCode)
+	}
+	metrics := struct {
+		Accounts []map[string]any `json:"accounts"`
+	}{}
+	doInto(t, gateway.Client(), gateway.URL+"/admin/api/metrics", &metrics)
+	seenDisabled := false
+	seenCooldown := false
+	for _, a := range metrics.Accounts {
+		if a["account_id"] == "acc_good" && a["enabled"] == false {
+			seenDisabled = true
+		}
+		if a["account_id"] == "acc_bad" && a["state"] == "cooldown" {
+			seenCooldown = true
+		}
+	}
+	if !seenDisabled || !seenCooldown {
+		t.Fatalf("expected disabled/cooldown states, got %#v", metrics.Accounts)
+	}
+}
+
 func TestAccessTokenProtectsGatewayRoutes(t *testing.T) {
 	ctx := context.Background()
 	ds := newFakeDownstream(t, "a")
@@ -278,6 +345,21 @@ func doJSONWithBearer(t *testing.T, c *http.Client, url string, token string, pa
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func doJSONStatus(t *testing.T, c *http.Client, url string, payload any) int {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
 }
 
 func doInto(t *testing.T, c *http.Client, url string, out any) {

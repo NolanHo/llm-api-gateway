@@ -15,32 +15,48 @@ type MonitoringSnapshot struct {
 }
 
 type GlobalMonitoringMetrics struct {
-	EnabledAccounts       int64 `json:"enabled_accounts"`
-	RetainedLineages      int64 `json:"retained_lineages"`
-	ActiveLineages        int64 `json:"active_lineages"`
-	InactiveLineages      int64 `json:"inactive_lineages"`
-	ActiveSessions        int64 `json:"active_sessions"`
-	ActiveCarriers        int64 `json:"active_carriers"`
-	RecentReplays         int64 `json:"recent_replays"`
-	RecentTurns           int64 `json:"recent_turns"`
-	RecentRoutingFailures int64 `json:"recent_routing_failures"`
+	EnabledAccounts       int64   `json:"enabled_accounts"`
+	RetainedLineages      int64   `json:"retained_lineages"`
+	ActiveLineages        int64   `json:"active_lineages"`
+	InactiveLineages      int64   `json:"inactive_lineages"`
+	ActiveSessions        int64   `json:"active_sessions"`
+	ActiveCarriers        int64   `json:"active_carriers"`
+	RecentReplays         int64   `json:"recent_replays"`
+	RecentTurns           int64   `json:"recent_turns"`
+	RecentRoutingFailures int64   `json:"recent_routing_failures"`
+	Recent30mTurns        int64   `json:"recent_30m_turns"`
+	Recent30mReplays      int64   `json:"recent_30m_replays"`
+	ReplayRate30m         float64 `json:"replay_rate_30m"`
+	RecentSuccesses       int64   `json:"recent_successes"`
+	RecentFailures        int64   `json:"recent_failures"`
+	FailureRate           float64 `json:"failure_rate"`
 }
 
 type AccountMonitoringMetric struct {
-	AccountID       string       `json:"account_id"`
-	DisplayName     string       `json:"display_name"`
-	DownstreamHost  string       `json:"downstream_host"`
-	DownstreamPort  int          `json:"downstream_port"`
-	LineageStatuses []LabelCount `json:"lineage_statuses"`
-	ActiveSessions  int64        `json:"active_sessions"`
-	ActiveCarriers  int64        `json:"active_carriers"`
-	CarrierKinds    []LabelCount `json:"carrier_kinds"`
-	RecentReplays   int64        `json:"recent_replays"`
-	ReplayReasons   []LabelCount `json:"replay_reasons"`
-	RecentTurns     int64        `json:"recent_turns"`
-	RouteModes      []LabelCount `json:"route_modes"`
-	RecentFailures  int64        `json:"recent_failures"`
-	FailureReasons  []LabelCount `json:"failure_reasons"`
+	AccountID        string       `json:"account_id"`
+	DisplayName      string       `json:"display_name"`
+	DownstreamHost   string       `json:"downstream_host"`
+	DownstreamPort   int          `json:"downstream_port"`
+	Enabled          bool         `json:"enabled"`
+	State            string       `json:"state"`
+	CooldownUntilMS  int64        `json:"cooldown_until_ms"`
+	CooldownReason   string       `json:"cooldown_reason"`
+	LineageStatuses  []LabelCount `json:"lineage_statuses"`
+	ActiveSessions   int64        `json:"active_sessions"`
+	ActiveCarriers   int64        `json:"active_carriers"`
+	CarrierKinds     []LabelCount `json:"carrier_kinds"`
+	RecentReplays    int64        `json:"recent_replays"`
+	ReplayReasons    []LabelCount `json:"replay_reasons"`
+	RecentTurns      int64        `json:"recent_turns"`
+	RouteModes       []LabelCount `json:"route_modes"`
+	RecentFailures   int64        `json:"recent_failures"`
+	FailureReasons   []LabelCount `json:"failure_reasons"`
+	RecentSuccesses  int64        `json:"recent_successes"`
+	FailureRate      float64      `json:"failure_rate"`
+	StatusCodes      []LabelCount `json:"status_codes"`
+	Recent30mTurns   int64        `json:"recent_30m_turns"`
+	Recent30mReplays int64        `json:"recent_30m_replays"`
+	ReplayRate30m    float64      `json:"replay_rate_30m"`
 }
 
 type LabelCount struct {
@@ -49,12 +65,16 @@ type LabelCount struct {
 }
 
 func (s *Store) MonitoringSnapshot(ctx context.Context, now time.Time, replayLookback time.Duration) (MonitoringSnapshot, error) {
+	if err := s.RefreshAccountCooldowns(ctx, now); err != nil {
+		return MonitoringSnapshot{}, err
+	}
 	if err := s.RefreshLineageStatuses(ctx, now); err != nil {
 		return MonitoringSnapshot{}, err
 	}
 	nowMS := now.UnixMilli()
 	activeCutoff := now.Add(-s.activeSessionWindow).UnixMilli()
 	replayCutoff := now.Add(-replayLookback).UnixMilli()
+	statsCutoff := now.Add(-30 * time.Minute).UnixMilli()
 	snapshot := MonitoringSnapshot{
 		CapturedAtMS:          nowMS,
 		ActiveSessionWindowMS: s.activeSessionWindow.Milliseconds(),
@@ -70,7 +90,9 @@ func (s *Store) MonitoringSnapshot(ctx context.Context, now time.Time, replayLoo
 		byAccount[snapshot.Accounts[i].AccountID] = &snapshot.Accounts[i]
 	}
 
-	snapshot.Global.EnabledAccounts = int64(len(snapshot.Accounts))
+	if snapshot.Global.EnabledAccounts, err = s.countInt64(ctx, `SELECT COUNT(*) FROM accounts WHERE enabled = 1`); err != nil {
+		return MonitoringSnapshot{}, err
+	}
 	if snapshot.Global.RetainedLineages, err = s.countInt64(ctx, `SELECT COUNT(*) FROM lineage_bindings WHERE retained_until_ms >= ?`, nowMS); err != nil {
 		return MonitoringSnapshot{}, err
 	}
@@ -89,6 +111,20 @@ func (s *Store) MonitoringSnapshot(ctx context.Context, now time.Time, replayLoo
 	if snapshot.Global.RecentRoutingFailures, err = s.countInt64(ctx, `SELECT COUNT(*) FROM routing_failures WHERE created_at_ms >= ?`, replayCutoff); err != nil {
 		return MonitoringSnapshot{}, err
 	}
+	if snapshot.Global.Recent30mTurns, err = s.countInt64(ctx, `SELECT COUNT(*) FROM turns_meta WHERE created_at_ms >= ?`, statsCutoff); err != nil {
+		return MonitoringSnapshot{}, err
+	}
+	if snapshot.Global.Recent30mReplays, err = s.countInt64(ctx, `SELECT COUNT(*) FROM replay_events WHERE created_at_ms >= ?`, statsCutoff); err != nil {
+		return MonitoringSnapshot{}, err
+	}
+	snapshot.Global.ReplayRate30m = ratio(snapshot.Global.Recent30mReplays, snapshot.Global.Recent30mTurns)
+	if snapshot.Global.RecentSuccesses, err = s.countInt64(ctx, `SELECT COUNT(*) FROM turns_meta WHERE created_at_ms >= ? AND request_status_code BETWEEN 200 AND 399`, statsCutoff); err != nil {
+		return MonitoringSnapshot{}, err
+	}
+	if snapshot.Global.RecentFailures, err = s.countInt64(ctx, `SELECT COUNT(*) FROM turns_meta WHERE created_at_ms >= ? AND (request_status_code >= 400 OR error_code IS NOT NULL)`, statsCutoff); err != nil {
+		return MonitoringSnapshot{}, err
+	}
+	snapshot.Global.FailureRate = ratio(snapshot.Global.RecentFailures, snapshot.Global.RecentSuccesses+snapshot.Global.RecentFailures)
 
 	lineageStatuses, err := s.groupedCounts(ctx, `SELECT account_id, status, COUNT(*) FROM lineage_bindings WHERE retained_until_ms >= ? GROUP BY account_id, status`, nowMS)
 	if err != nil {
@@ -157,6 +193,58 @@ func (s *Store) MonitoringSnapshot(ctx context.Context, now time.Time, replayLoo
 		}
 	}
 
+	statusCodes, err := s.groupedCounts(ctx, `SELECT COALESCE(account_id,''), COALESCE(CAST(request_status_code AS TEXT),'0'), COUNT(*) FROM turns_meta WHERE created_at_ms >= ? GROUP BY COALESCE(account_id,''), COALESCE(CAST(request_status_code AS TEXT),'0')`, statsCutoff)
+	if err != nil {
+		return MonitoringSnapshot{}, err
+	}
+	for accountID, xs := range statusCodes {
+		if a := byAccount[accountID]; a != nil {
+			a.StatusCodes = xs
+		}
+	}
+
+	recentSuccesses, err := s.singleGroupedCounts(ctx, `SELECT COALESCE(account_id,''), COUNT(*) FROM turns_meta WHERE created_at_ms >= ? AND request_status_code BETWEEN 200 AND 399 GROUP BY COALESCE(account_id,'')`, statsCutoff)
+	if err != nil {
+		return MonitoringSnapshot{}, err
+	}
+	for accountID, count := range recentSuccesses {
+		if a := byAccount[accountID]; a != nil {
+			a.RecentSuccesses = count
+		}
+	}
+	recentFailures, err := s.singleGroupedCounts(ctx, `SELECT COALESCE(account_id,''), COUNT(*) FROM turns_meta WHERE created_at_ms >= ? AND (request_status_code >= 400 OR error_code IS NOT NULL) GROUP BY COALESCE(account_id,'')`, statsCutoff)
+	if err != nil {
+		return MonitoringSnapshot{}, err
+	}
+	for accountID, count := range recentFailures {
+		if a := byAccount[accountID]; a != nil {
+			a.RecentFailures += count
+		}
+	}
+	recent30Turns, err := s.singleGroupedCounts(ctx, `SELECT COALESCE(account_id,''), COUNT(*) FROM turns_meta WHERE created_at_ms >= ? GROUP BY COALESCE(account_id,'')`, statsCutoff)
+	if err != nil {
+		return MonitoringSnapshot{}, err
+	}
+	for accountID, count := range recent30Turns {
+		if a := byAccount[accountID]; a != nil {
+			a.Recent30mTurns = count
+		}
+	}
+	recent30Replays, err := s.singleGroupedCounts(ctx, `SELECT COALESCE(new_account_id,''), COUNT(*) FROM replay_events WHERE created_at_ms >= ? GROUP BY COALESCE(new_account_id,'')`, statsCutoff)
+	if err != nil {
+		return MonitoringSnapshot{}, err
+	}
+	for accountID, count := range recent30Replays {
+		if a := byAccount[accountID]; a != nil {
+			a.Recent30mReplays = count
+		}
+	}
+	for i := range snapshot.Accounts {
+		a := &snapshot.Accounts[i]
+		a.FailureRate = ratio(a.RecentFailures, a.RecentSuccesses+a.RecentFailures)
+		a.ReplayRate30m = ratio(a.Recent30mReplays, a.Recent30mTurns)
+	}
+
 	failureReasons, err := s.groupedCounts(ctx, `SELECT COALESCE(account_id,''), reason_code, COUNT(*) FROM routing_failures WHERE created_at_ms >= ? GROUP BY COALESCE(account_id,''), reason_code`, replayCutoff)
 	if err != nil {
 		return MonitoringSnapshot{}, err
@@ -164,9 +252,6 @@ func (s *Store) MonitoringSnapshot(ctx context.Context, now time.Time, replayLoo
 	for accountID, xs := range failureReasons {
 		if a := byAccount[accountID]; a != nil {
 			a.FailureReasons = xs
-			for _, x := range xs {
-				a.RecentFailures += x.Count
-			}
 		}
 	}
 
@@ -178,7 +263,7 @@ func (s *Store) MonitoringSnapshot(ctx context.Context, now time.Time, replayLoo
 }
 
 func (s *Store) monitoringAccounts(ctx context.Context) ([]AccountMonitoringMetric, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT account_id, display_name, downstream_host, downstream_port FROM accounts WHERE enabled = 1 ORDER BY account_id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT account_id, display_name, downstream_host, downstream_port, enabled, state, cooldown_until_ms, cooldown_reason FROM accounts ORDER BY account_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -186,9 +271,11 @@ func (s *Store) monitoringAccounts(ctx context.Context) ([]AccountMonitoringMetr
 	out := make([]AccountMonitoringMetric, 0)
 	for rows.Next() {
 		var row AccountMonitoringMetric
-		if err := rows.Scan(&row.AccountID, &row.DisplayName, &row.DownstreamHost, &row.DownstreamPort); err != nil {
+		var enabled int
+		if err := rows.Scan(&row.AccountID, &row.DisplayName, &row.DownstreamHost, &row.DownstreamPort, &enabled, &row.State, &row.CooldownUntilMS, &row.CooldownReason); err != nil {
 			return nil, err
 		}
+		row.Enabled = enabled == 1
 		out = append(out, row)
 	}
 	return out, rows.Err()
@@ -229,6 +316,13 @@ func (s *Store) groupedCounts(ctx context.Context, query string, args ...any) (m
 		out[key] = append(out[key], LabelCount{Label: label, Count: count})
 	}
 	return out, rows.Err()
+}
+
+func ratio(n, d int64) float64 {
+	if d <= 0 {
+		return 0
+	}
+	return float64(n) / float64(d)
 }
 
 func (s *Store) labelCounts(ctx context.Context, query string, args ...any) ([]LabelCount, error) {

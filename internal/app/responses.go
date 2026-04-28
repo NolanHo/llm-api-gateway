@@ -201,16 +201,39 @@ func (a *App) planRoute(ctx context.Context, parsed responses.Request, now time.
 		return routePlan{}, err
 	}
 	if owner, ok := lookup.UniqueOwner(); ok {
-		span.SetAttributes(attribute.String("gateway.route.reason_code", "carrier_owner_hit"), attribute.String("gateway.account.id", owner.AccountID))
+		account, err := a.sqlite.GetAccount(ctx, owner.AccountID)
+		if err == nil && account.Enabled && account.State == "running" {
+			span.SetAttributes(attribute.String("gateway.route.reason_code", "carrier_owner_hit"), attribute.String("gateway.account.id", owner.AccountID))
+			return routePlan{
+				Mode:             "strict",
+				ReasonCode:       "carrier_owner_hit",
+				Account:          account,
+				LineageSessionID: owner.LineageSessionID,
+				HasRealCarrier:   true,
+				CarrierKinds:     responses.CarrierKinds(carriers),
+				ForwardBody:      mustJSON(parsed.Raw),
+				ForwardMap:       parsed.Raw,
+			}, nil
+		}
+		stripped, removedKinds, removedCount := responses.StripCarriers(parsed.Raw)
+		fallback, selectErr := a.sqlite.SelectLeastActiveAccount(ctx, stringValue(parsed.Raw, "model"), now)
+		if selectErr != nil {
+			span.RecordError(selectErr)
+			return routePlan{}, selectErr
+		}
+		span.SetAttributes(attribute.String("gateway.route.reason_code", "carrier_owner_unavailable"), attribute.String("gateway.account.id", fallback.AccountID))
 		return routePlan{
-			Mode:             "strict",
-			ReasonCode:       "carrier_owner_hit",
-			Account:          sqlitestore.Account{AccountID: owner.AccountID, DownstreamHost: owner.OwnerHost, DownstreamPort: owner.OwnerPort},
-			LineageSessionID: owner.LineageSessionID,
-			HasRealCarrier:   true,
-			CarrierKinds:     responses.CarrierKinds(carriers),
-			ForwardBody:      mustJSON(parsed.Raw),
-			ForwardMap:       parsed.Raw,
+			Mode:                "replay",
+			ReasonCode:          "carrier_owner_unavailable",
+			ReasonDetail:        fmt.Sprintf("carrier owner %s is unavailable", owner.AccountID),
+			Account:             fallback,
+			LineageSessionID:    ids.New("lineage"),
+			HasRealCarrier:      true,
+			CarrierKinds:        responses.CarrierKinds(carriers),
+			RemovedCarrierKinds: removedKinds,
+			RemovedCarrierCount: removedCount,
+			ForwardBody:         mustJSON(stripped),
+			ForwardMap:          stripped,
 		}, nil
 	}
 	stripped, removedKinds, removedCount := responses.StripCarriers(parsed.Raw)
@@ -255,6 +278,7 @@ func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, turnID, t
 	resp, err := a.client.Do(req)
 	if err != nil {
 		a.telemetry.Metrics.UpstreamFailures.Add(ctx, 1)
+		a.cooldownForStatus(ctx, plan.Account.AccountID, http.StatusBadGateway, "upstream_request_failed", now)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "upstream request failed")
 		_ = a.sqlite.InsertRoutingFailure(ctx, ids.New("failure"), turnID, plan.LineageSessionID, plan.Account.AccountID, "upstream_request_failed", err.Error(), http.StatusBadGateway, now)
@@ -280,6 +304,7 @@ func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, turnID, t
 	_, _ = w.Write(body)
 	if resp.StatusCode >= 400 {
 		a.telemetry.Metrics.UpstreamFailures.Add(ctx, 1)
+		a.cooldownForStatus(ctx, plan.Account.AccountID, resp.StatusCode, "upstream_rejected", now)
 		_ = a.sqlite.InsertRoutingFailure(ctx, ids.New("failure"), turnID, plan.LineageSessionID, plan.Account.AccountID, "upstream_rejected", string(body), resp.StatusCode, now)
 		return forwardResult{StatusCode: resp.StatusCode, ErrorCode: "upstream_rejected", ErrorMessage: string(body)}, nil
 	}
@@ -323,6 +348,7 @@ func (a *App) forwardStreamingResponses(w http.ResponseWriter, resp *http.Respon
 	}
 	if resp.StatusCode >= 400 {
 		a.telemetry.Metrics.UpstreamFailures.Add(ctx, 1)
+		a.cooldownForStatus(ctx, plan.Account.AccountID, resp.StatusCode, "upstream_rejected", now)
 		return forwardResult{StatusCode: resp.StatusCode, ErrorCode: "upstream_rejected", ResponseItems: collector.ResponseItems(), StreamState: collector.StreamState(), FinishReason: collector.FinishReason()}, nil
 	}
 	if err := a.upsertResponseCarriers(ctx, turnID, plan, now, collector.Carriers()); err != nil {
@@ -332,6 +358,16 @@ func (a *App) forwardStreamingResponses(w http.ResponseWriter, resp *http.Respon
 		_ = a.sqlite.InsertReplayEvent(ctx, ids.New("replay"), turnID, turnID, plan.LineageSessionID, "", plan.Account.AccountID, plan.ReasonCode, strings.Join(plan.RemovedCarrierKinds, ","), plan.RemovedCarrierCount, now)
 	}
 	return forwardResult{StatusCode: resp.StatusCode, ResponseItems: collector.ResponseItems(), StreamState: collector.StreamState(), FinishReason: collector.FinishReason()}, nil
+}
+
+func (a *App) cooldownForStatus(ctx context.Context, accountID string, status int, reason string, now time.Time) {
+	switch status {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable:
+		until := now.Add(5 * time.Minute)
+		if err := a.sqlite.CooldownAccount(ctx, accountID, fmt.Sprintf("%s_%d", reason, status), until, now); err != nil {
+			a.logger.Error("cooldown account", logging.Err(err), logging.String("account_id", accountID), logging.Int64("http_status", int64(status)))
+		}
+	}
 }
 
 func (a *App) upsertResponseCarriers(ctx context.Context, turnID string, plan routePlan, now time.Time, carriers []responses.Carrier) error {

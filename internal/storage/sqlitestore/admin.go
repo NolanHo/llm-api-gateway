@@ -12,6 +12,10 @@ type AccountOverview struct {
 	DisplayName        string        `json:"display_name"`
 	DownstreamHost     string        `json:"downstream_host"`
 	DownstreamPort     int           `json:"downstream_port"`
+	Enabled            bool          `json:"enabled"`
+	State              string        `json:"state"`
+	CooldownUntilMS    int64         `json:"cooldown_until_ms"`
+	CooldownReason     string        `json:"cooldown_reason"`
 	ActiveSessionCount int64         `json:"active_session_count"`
 	ActiveCarrierCount int64         `json:"active_carrier_count"`
 	RecentReplayCount  int64         `json:"recent_replay_count"`
@@ -86,10 +90,13 @@ type RoutingFailureView struct {
 }
 
 func (s *Store) ListAccountOverviews(ctx context.Context, now time.Time, replayLookback time.Duration) ([]AccountOverview, error) {
+	if err := s.RefreshAccountCooldowns(ctx, now); err != nil {
+		return nil, err
+	}
 	if err := s.RefreshLineageStatuses(ctx, now); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT account_id, display_name, downstream_host, downstream_port FROM accounts WHERE enabled = 1 ORDER BY account_id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT account_id, display_name, downstream_host, downstream_port, enabled, state, cooldown_until_ms, cooldown_reason FROM accounts ORDER BY account_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -97,9 +104,11 @@ func (s *Store) ListAccountOverviews(ctx context.Context, now time.Time, replayL
 	out := make([]AccountOverview, 0)
 	for rows.Next() {
 		var overview AccountOverview
-		if err := rows.Scan(&overview.AccountID, &overview.DisplayName, &overview.DownstreamHost, &overview.DownstreamPort); err != nil {
+		var enabled int
+		if err := rows.Scan(&overview.AccountID, &overview.DisplayName, &overview.DownstreamHost, &overview.DownstreamPort, &enabled, &overview.State, &overview.CooldownUntilMS, &overview.CooldownReason); err != nil {
 			return nil, err
 		}
+		overview.Enabled = enabled == 1
 		out = append(out, overview)
 	}
 	if err := rows.Err(); err != nil {
@@ -117,12 +126,17 @@ func (s *Store) ListAccountOverviews(ctx context.Context, now time.Time, replayL
 
 func (s *Store) GetAccountOverview(ctx context.Context, accountID string, now time.Time, replayLookback time.Duration, recentTurnsLimit int) (AccountOverview, error) {
 	var overview AccountOverview
+	if err := s.RefreshAccountCooldowns(ctx, now); err != nil {
+		return overview, err
+	}
 	if err := s.RefreshLineageStatuses(ctx, now); err != nil {
 		return overview, err
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT account_id, display_name, downstream_host, downstream_port FROM accounts WHERE account_id = ?`, accountID).Scan(&overview.AccountID, &overview.DisplayName, &overview.DownstreamHost, &overview.DownstreamPort); err != nil {
+	var enabled int
+	if err := s.db.QueryRowContext(ctx, `SELECT account_id, display_name, downstream_host, downstream_port, enabled, state, cooldown_until_ms, cooldown_reason FROM accounts WHERE account_id = ?`, accountID).Scan(&overview.AccountID, &overview.DisplayName, &overview.DownstreamHost, &overview.DownstreamPort, &enabled, &overview.State, &overview.CooldownUntilMS, &overview.CooldownReason); err != nil {
 		return overview, err
 	}
+	overview.Enabled = enabled == 1
 	activeCutoff := now.Add(-s.activeSessionWindow).UnixMilli()
 	replayCutoff := now.Add(-replayLookback).UnixMilli()
 	overview.ActiveSessionCount, _ = s.countInt64(ctx, `SELECT COUNT(DISTINCT lineage_session_id) FROM lineage_bindings WHERE account_id = ? AND last_seen_at_ms >= ? AND retained_until_ms >= ?`, accountID, activeCutoff, now.UnixMilli())

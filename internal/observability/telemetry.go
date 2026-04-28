@@ -42,6 +42,15 @@ type Metrics struct {
 	RecentReplays         metric.Int64ObservableGauge
 	RecentTurns           metric.Int64ObservableGauge
 	RecentRoutingFailures metric.Int64ObservableGauge
+	AccountEnabled        metric.Int64ObservableGauge
+	AccountCooldownUntil  metric.Int64ObservableGauge
+	RecentSuccesses       metric.Int64ObservableGauge
+	RecentFailures        metric.Int64ObservableGauge
+	RecentStatusCodes     metric.Int64ObservableGauge
+	Recent30mReplays      metric.Int64ObservableGauge
+	Recent30mTurns        metric.Int64ObservableGauge
+	FailureRate           metric.Float64ObservableGauge
+	ReplayRate30m         metric.Float64ObservableGauge
 	runtimeGaugeCallback  metric.Registration
 }
 
@@ -55,6 +64,15 @@ func (m *Metrics) RegisterRuntimeGauges(meter metric.Meter, callback metric.Call
 		m.RecentReplays,
 		m.RecentTurns,
 		m.RecentRoutingFailures,
+		m.AccountEnabled,
+		m.AccountCooldownUntil,
+		m.RecentSuccesses,
+		m.RecentFailures,
+		m.RecentStatusCodes,
+		m.Recent30mReplays,
+		m.Recent30mTurns,
+		m.FailureRate,
+		m.ReplayRate30m,
 	)
 	if err != nil {
 		return err
@@ -177,6 +195,42 @@ func newMetrics(meter metric.Meter) (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	accountEnabled, err := meter.Int64ObservableGauge("gateway_account_enabled")
+	if err != nil {
+		return nil, err
+	}
+	accountCooldownUntil, err := meter.Int64ObservableGauge("gateway_account_cooldown_until_ms")
+	if err != nil {
+		return nil, err
+	}
+	recentSuccesses, err := meter.Int64ObservableGauge("gateway_recent_30m_successes")
+	if err != nil {
+		return nil, err
+	}
+	recentFailures, err := meter.Int64ObservableGauge("gateway_recent_30m_failures")
+	if err != nil {
+		return nil, err
+	}
+	recentStatusCodes, err := meter.Int64ObservableGauge("gateway_recent_30m_status_codes")
+	if err != nil {
+		return nil, err
+	}
+	recent30mReplays, err := meter.Int64ObservableGauge("gateway_recent_30m_replays")
+	if err != nil {
+		return nil, err
+	}
+	recent30mTurns, err := meter.Int64ObservableGauge("gateway_recent_30m_turns")
+	if err != nil {
+		return nil, err
+	}
+	failureRate, err := meter.Float64ObservableGauge("gateway_recent_30m_failure_rate")
+	if err != nil {
+		return nil, err
+	}
+	replayRate30m, err := meter.Float64ObservableGauge("gateway_recent_30m_replay_rate")
+	if err != nil {
+		return nil, err
+	}
 	return &Metrics{
 		UpstreamRequests:      upstreamRequests,
 		UpstreamFailures:      upstreamFailures,
@@ -193,6 +247,15 @@ func newMetrics(meter metric.Meter) (*Metrics, error) {
 		RecentReplays:         recentReplays,
 		RecentTurns:           recentTurns,
 		RecentRoutingFailures: recentRoutingFailures,
+		AccountEnabled:        accountEnabled,
+		AccountCooldownUntil:  accountCooldownUntil,
+		RecentSuccesses:       recentSuccesses,
+		RecentFailures:        recentFailures,
+		RecentStatusCodes:     recentStatusCodes,
+		Recent30mReplays:      recent30mReplays,
+		Recent30mTurns:        recent30mTurns,
+		FailureRate:           failureRate,
+		ReplayRate30m:         replayRate30m,
 	}, nil
 }
 

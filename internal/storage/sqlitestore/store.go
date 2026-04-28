@@ -44,6 +44,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			downstream_port INTEGER NOT NULL,
 			enabled INTEGER NOT NULL,
 			state TEXT NOT NULL,
+			cooldown_until_ms INTEGER NOT NULL DEFAULT 0,
+			cooldown_reason TEXT NOT NULL DEFAULT '',
 			model_allowlist_json TEXT NOT NULL,
 			weight INTEGER NOT NULL DEFAULT 1,
 			created_at_ms INTEGER NOT NULL,
@@ -111,6 +113,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_turns_meta_lineage ON turns_meta(lineage_session_id, created_at_ms);`,
 		`CREATE INDEX IF NOT EXISTS idx_turns_meta_parent ON turns_meta(parent_turn_id, replay_parent_turn_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_turns_meta_fingerprint ON turns_meta(weak_history_fingerprint);`,
+		`CREATE INDEX IF NOT EXISTS idx_turns_meta_account_status ON turns_meta(account_id, request_status_code, created_at_ms);`,
 		`CREATE TABLE IF NOT EXISTS replay_events (
 			replay_event_id TEXT PRIMARY KEY,
 			from_turn_id TEXT NOT NULL,
@@ -142,5 +145,40 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("exec migration: %w", err)
 		}
 	}
+	if err := s.ensureColumn(ctx, "accounts", "cooldown_until_ms", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "accounts", "cooldown_reason", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_accounts_state ON accounts(enabled, state, cooldown_until_ms)`); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column+` `+definition)
+	return err
 }

@@ -40,6 +40,12 @@ func observeGlobalMetrics(o metric.Observer, m *observability.Metrics, snapshot 
 	o.ObserveInt64(m.RecentReplays, snapshot.Global.RecentReplays)
 	o.ObserveInt64(m.RecentTurns, snapshot.Global.RecentTurns)
 	o.ObserveInt64(m.RecentRoutingFailures, snapshot.Global.RecentRoutingFailures)
+	o.ObserveInt64(m.RecentSuccesses, snapshot.Global.RecentSuccesses)
+	o.ObserveInt64(m.RecentFailures, snapshot.Global.RecentFailures)
+	o.ObserveInt64(m.Recent30mTurns, snapshot.Global.Recent30mTurns)
+	o.ObserveInt64(m.Recent30mReplays, snapshot.Global.Recent30mReplays)
+	o.ObserveFloat64(m.FailureRate, snapshot.Global.FailureRate)
+	o.ObserveFloat64(m.ReplayRate30m, snapshot.Global.ReplayRate30m)
 }
 
 func observeAccountMetrics(o metric.Observer, m *observability.Metrics, account sqlitestore.AccountMonitoringMetric) {
@@ -48,11 +54,32 @@ func observeAccountMetrics(o metric.Observer, m *observability.Metrics, account 
 		attribute.String("downstream_host", account.DownstreamHost),
 		attribute.Int("downstream_port", account.DownstreamPort),
 	)
+	enabled := int64(0)
+	if account.Enabled {
+		enabled = 1
+	}
+	o.ObserveInt64(m.AccountEnabled, enabled, attrs)
+	o.ObserveInt64(m.AccountCooldownUntil, account.CooldownUntilMS, attrs)
 	o.ObserveInt64(m.ActiveSessions, account.ActiveSessions, attrs)
 	o.ObserveInt64(m.ActiveCarriers, account.ActiveCarriers, attrs)
 	o.ObserveInt64(m.RecentReplays, account.RecentReplays, attrs)
 	o.ObserveInt64(m.RecentTurns, account.RecentTurns, attrs)
 	o.ObserveInt64(m.RecentRoutingFailures, account.RecentFailures, attrs)
+	o.ObserveInt64(m.RecentSuccesses, account.RecentSuccesses, attrs)
+	o.ObserveInt64(m.RecentFailures, account.RecentFailures, attrs)
+	o.ObserveInt64(m.Recent30mTurns, account.Recent30mTurns, attrs)
+	o.ObserveInt64(m.Recent30mReplays, account.Recent30mReplays, attrs)
+	o.ObserveFloat64(m.FailureRate, account.FailureRate, attrs)
+	o.ObserveFloat64(m.ReplayRate30m, account.ReplayRate30m, attrs)
+
+	for _, x := range account.StatusCodes {
+		o.ObserveInt64(m.RecentStatusCodes, x.Count, observability.ObserveAttrs(
+			attribute.String("account_id", account.AccountID),
+			attribute.String("downstream_host", account.DownstreamHost),
+			attribute.Int("downstream_port", account.DownstreamPort),
+			attribute.String("status_code", x.Label),
+		))
+	}
 
 	for _, x := range account.LineageStatuses {
 		o.ObserveInt64(m.LineageBindings, x.Count, observability.ObserveAttrs(
