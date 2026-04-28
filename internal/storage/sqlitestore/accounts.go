@@ -73,15 +73,15 @@ func (s *Store) SelectLeastActiveAccount(ctx context.Context, model string, now 
 	if err := s.RefreshLineageStatuses(ctx, now); err != nil {
 		return Account{}, err
 	}
+	counts, err := s.activeSessionCounts(ctx, now)
+	if err != nil {
+		return Account{}, err
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT account_id, provider_kind, display_name, downstream_host, downstream_port, enabled, state, model_allowlist_json, weight FROM accounts WHERE enabled = 1 AND state = 'running'`)
 	if err != nil {
 		return Account{}, err
 	}
 	defer rows.Close()
-	counts, err := s.activeSessionCounts(ctx, now)
-	if err != nil {
-		return Account{}, err
-	}
 	candidates := make([]struct {
 		account Account
 		count   int64
