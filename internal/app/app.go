@@ -11,6 +11,7 @@ import (
 
 	"github.com/nolanho/llm-api-gateway/internal/config"
 	"github.com/nolanho/llm-api-gateway/internal/logging"
+	"github.com/nolanho/llm-api-gateway/internal/observability"
 	"github.com/nolanho/llm-api-gateway/internal/security"
 	"github.com/nolanho/llm-api-gateway/internal/storage/duckstore"
 	"github.com/nolanho/llm-api-gateway/internal/storage/sqlitestore"
@@ -18,13 +19,14 @@ import (
 )
 
 type App struct {
-	cfg    config.Config
-	logger *zap.Logger
-	sqlite *sqlitestore.Store
-	duck   *duckstore.Store
-	mux    *http.ServeMux
-	client *http.Client
-	hasher security.CarrierHasher
+	cfg       config.Config
+	logger    *zap.Logger
+	telemetry *observability.Telemetry
+	sqlite    *sqlitestore.Store
+	duck      *duckstore.Store
+	mux       *http.ServeMux
+	client    *http.Client
+	hasher    security.CarrierHasher
 }
 
 func New(ctx context.Context, cfg config.Config, logger *zap.Logger) (*App, error) {
@@ -34,30 +36,38 @@ func New(ctx context.Context, cfg config.Config, logger *zap.Logger) (*App, erro
 	if err := os.MkdirAll(filepath.Dir(cfg.DuckDBPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create duckdb dir: %w", err)
 	}
+	telemetry, err := observability.Init(ctx, cfg.ServiceName, cfg.OTELStdout)
+	if err != nil {
+		return nil, fmt.Errorf("init telemetry: %w", err)
+	}
 
 	sqliteStore, err := sqlitestore.Open(ctx, cfg.SQLitePath, cfg.ActiveSessionWindow, cfg.InactiveSessionRetain)
 	if err != nil {
+		_ = telemetry.Close(ctx)
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	duckStore, err := duckstore.Open(ctx, cfg.DuckDBPath)
 	if err != nil {
 		_ = sqliteStore.Close(ctx)
+		_ = telemetry.Close(ctx)
 		return nil, fmt.Errorf("open duckdb: %w", err)
 	}
 	if err := seedAccounts(ctx, cfg, sqliteStore); err != nil {
 		_ = duckStore.Close(ctx)
 		_ = sqliteStore.Close(ctx)
+		_ = telemetry.Close(ctx)
 		return nil, fmt.Errorf("seed accounts: %w", err)
 	}
 
 	a := &App{
-		cfg:    cfg,
-		logger: logger,
-		sqlite: sqliteStore,
-		duck:   duckStore,
-		mux:    http.NewServeMux(),
-		client: &http.Client{Timeout: cfg.UpstreamTimeout},
-		hasher: security.NewCarrierHasher(cfg.CarrierHMACKey),
+		cfg:       cfg,
+		logger:    logger,
+		telemetry: telemetry,
+		sqlite:    sqliteStore,
+		duck:      duckStore,
+		mux:       http.NewServeMux(),
+		client:    &http.Client{Timeout: cfg.UpstreamTimeout},
+		hasher:    security.NewCarrierHasher(cfg.CarrierHMACKey),
 	}
 	a.routes()
 	logger.Info("storage initialized",
@@ -103,6 +113,7 @@ func (a *App) routes() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ready"}`))
 	})
+	a.mux.Handle("/metrics", a.telemetry.Handler)
 	a.mux.HandleFunc("/v1/responses", a.handleResponses)
 }
 
@@ -112,5 +123,8 @@ func (a *App) Close(ctx context.Context) error {
 	if err := a.duck.Close(ctx); err != nil {
 		return err
 	}
-	return a.sqlite.Close(ctx)
+	if err := a.sqlite.Close(ctx); err != nil {
+		return err
+	}
+	return a.telemetry.Close(ctx)
 }

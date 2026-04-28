@@ -10,6 +10,8 @@ import (
 type Config struct {
 	ListenAddr            string
 	LogJSON               bool
+	ServiceName           string
+	OTELStdout            bool
 	SQLitePath            string
 	DuckDBPath            string
 	AccountsFile          string
@@ -25,6 +27,8 @@ func Load() (Config, error) {
 	cfg := Config{
 		ListenAddr:            getenv("LLM_GATEWAY_LISTEN_ADDR", ":8080"),
 		LogJSON:               getenvBool("LLM_GATEWAY_LOG_JSON", true),
+		ServiceName:           getenv("LLM_GATEWAY_SERVICE_NAME", "llm-api-gateway"),
+		OTELStdout:            getenvBool("LLM_GATEWAY_OTEL_STDOUT", false),
 		SQLitePath:            getenv("LLM_GATEWAY_SQLITE_PATH", "var/llm-api-gateway.sqlite3"),
 		DuckDBPath:            getenv("LLM_GATEWAY_DUCKDB_PATH", "var/llm-api-gateway.duckdb"),
 		AccountsFile:          getenv("LLM_GATEWAY_ACCOUNTS_FILE", ""),
