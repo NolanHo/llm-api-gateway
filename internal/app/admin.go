@@ -77,6 +77,17 @@ h3 { margin: 16px 0 10px; font-size: 14px; }
 .section-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 16px 18px; border-bottom: 1px solid var(--line); }
 .section-title { display: flex; align-items: center; gap: 10px; }
 .panel-body { padding: 16px 18px 18px; }
+.load-card { margin-bottom: 16px; }
+.load-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.load-row { display: grid; grid-template-columns: minmax(130px, .7fr) minmax(180px, 1.3fr) auto; gap: 12px; align-items: center; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: white; }
+.load-name { font-weight: 720; }
+.load-sub { margin-top: 3px; color: var(--muted); font-size: 12px; }
+.load-bars { display: grid; gap: 7px; }
+.load-bar { display: grid; grid-template-columns: 70px 1fr 42px; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; }
+.load-track { height: 8px; border-radius: 999px; background: #eef2ff; overflow: hidden; }
+.load-fill { height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2563eb, #7c3aed); }
+.load-fill.replay { background: linear-gradient(90deg, #059669, #10b981); }
+.load-score { min-width: 52px; text-align: right; font-weight: 760; }
 .account-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; }
 .account-card { border: 1px solid var(--line); border-radius: 16px; background: white; padding: 14px; }
 .account-top { display: flex; justify-content: space-between; gap: 12px; align-items: start; }
@@ -99,8 +110,8 @@ tr:hover td { background: #fcfcfd; }
 .empty, .error { padding: 18px; border-radius: 14px; }
 .empty { color: var(--muted); border: 1px dashed var(--line); background: #fbfdff; }
 .error { margin-top: 16px; color: var(--red); border: 1px solid var(--red-soft); background: #fff7f7; }
-@media (max-width: 1180px) { .stat-grid { grid-template-columns: repeat(3, minmax(0,1fr)); } .layout { grid-template-columns: 1fr; } }
-@media (max-width: 760px) { .shell { width: min(100% - 20px, 1440px); padding-top: 12px; } .hero { align-items: flex-start; flex-direction: column; } .toolbar { justify-content: flex-start; } .stat-grid, .account-grid { grid-template-columns: 1fr; } .mini-stats { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+@media (max-width: 1180px) { .stat-grid { grid-template-columns: repeat(3, minmax(0,1fr)); } .layout, .load-grid { grid-template-columns: 1fr; } }
+@media (max-width: 760px) { .shell { width: min(100% - 20px, 1440px); padding-top: 12px; } .hero { align-items: flex-start; flex-direction: column; } .toolbar { justify-content: flex-start; } .stat-grid, .account-grid { grid-template-columns: 1fr; } .mini-stats { grid-template-columns: repeat(2, minmax(0,1fr)); } .load-row { grid-template-columns: 1fr; } .load-score { text-align: left; } }
 </style>
 </head>
 <body>
@@ -121,6 +132,14 @@ tr:hover td { background: #fcfcfd; }
   </header>
 
   <section class="grid stat-grid" id="stats"></section>
+
+  <section class="card load-card">
+    <div class="section-head">
+      <div class="section-title"><span class="section-icon" data-icon="activity"></span><h2>Account load</h2></div>
+      <span class="meta">score = sessions x10 + carriers x3 + turns + replays x2 + failures x5</span>
+    </div>
+    <div class="panel-body" id="load"></div>
+  </section>
 
   <div class="grid layout">
     <main class="stack">
@@ -258,6 +277,29 @@ function renderStats(snapshot) {
     statCard('Failures', g.recent_routing_failures, 'last 24h', 'alert')
   ].join('');
 }
+function loadScore(a) {
+  return a.active_sessions * 10 + a.active_carriers * 3 + a.recent_turn_count + a.recent_replay_count * 2 + a.recent_failure_count * 5;
+}
+function pct(value, max) {
+  if (max <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round(value * 100 / max)));
+}
+function renderLoad(accounts) {
+  if (!accounts.length) return '<div class="empty">empty</div>';
+  const maxScore = Math.max(1, ...accounts.map(loadScore));
+  const maxTurns = Math.max(1, ...accounts.map(a => a.recent_turn_count));
+  const maxReplays = Math.max(1, ...accounts.map(a => a.recent_replay_count));
+  const sorted = accounts.slice().sort((a, b) => loadScore(b) - loadScore(a) || a.downstream_port - b.downstream_port);
+  return '<div class="load-grid">' + sorted.map(a => {
+    const score = loadScore(a);
+    return '<div class="load-row"><div><div class="load-name">' + escapeHTML(a.display_name) + '</div><div class="load-sub">' + escapeHTML(a.account_id) + ' / :' + escapeHTML(a.downstream_port) + '</div></div>' +
+      '<div class="load-bars">' +
+        '<div class="load-bar"><span>score</span><div class="load-track"><div class="load-fill" style="width:' + pct(score, maxScore) + '%"></div></div><span>' + fmt(score) + '</span></div>' +
+        '<div class="load-bar"><span>turns</span><div class="load-track"><div class="load-fill" style="width:' + pct(a.recent_turn_count, maxTurns) + '%"></div></div><span>' + fmt(a.recent_turn_count) + '</span></div>' +
+        '<div class="load-bar"><span>replay</span><div class="load-track"><div class="load-fill replay" style="width:' + pct(a.recent_replay_count, maxReplays) + '%"></div></div><span>' + fmt(a.recent_replay_count) + '</span></div>' +
+      '</div><div class="load-score">' + badge('sessions ' + fmt(a.active_sessions), a.active_sessions > 0 ? 'warn' : '') + '</div></div>';
+  }).join('') + '</div>';
+}
 function renderAccounts(accounts) {
   if (!accounts.length) return '<div class="empty">empty</div>';
   return '<div class="account-grid">' + accounts.map(a => {
@@ -305,9 +347,11 @@ async function main() {
     ]);
     byId('captured').textContent = 'captured ' + new Date(num(monitoring.captured_at_ms)).toLocaleString();
     byId('active-window').textContent = fmtDuration(monitoring.active_session_window_ms);
+    const accounts = normalizeAccounts(monitoring.accounts, accountPayload.accounts);
     renderStats(monitoring);
     renderMonitoring(monitoring);
-    byId('accounts').innerHTML = renderAccounts(normalizeAccounts(monitoring.accounts, accountPayload.accounts));
+    byId('load').innerHTML = renderLoad(accounts);
+    byId('accounts').innerHTML = renderAccounts(accounts);
     byId('events').innerHTML = renderTable(eventPayload.failures);
     await renderLineage();
     mountIcons();
