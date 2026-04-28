@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -15,6 +16,7 @@ import (
 	"github.com/nolanho/llm-api-gateway/internal/ids"
 	"github.com/nolanho/llm-api-gateway/internal/logging"
 	"github.com/nolanho/llm-api-gateway/internal/responses"
+	"github.com/nolanho/llm-api-gateway/internal/storage/duckstore"
 	"github.com/nolanho/llm-api-gateway/internal/storage/sqlitestore"
 )
 
@@ -30,6 +32,7 @@ type routePlan struct {
 	RemovedCarrierKinds []string
 	RemovedCarrierCount int
 	ForwardBody         []byte
+	ForwardMap          map[string]any
 }
 
 func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
@@ -39,6 +42,7 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC()
 	turnID := ids.New("turn")
+	turnPK := turnID
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		a.writeRoutingError(w, r, turnID, ids.New("lineage"), "invalid_request_body", err.Error(), http.StatusBadRequest, now)
@@ -64,7 +68,6 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
 	if err := a.sqlite.UpsertLineageBinding(r.Context(), plan.LineageSessionID, plan.Account, turnID, now); err != nil {
 		a.writeRoutingError(w, r, turnID, plan.LineageSessionID, "sqlite_lookup_error", err.Error(), http.StatusInternalServerError, now)
 		return
@@ -97,9 +100,25 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 			logging.String("removed_carrier_kinds", strings.Join(plan.RemovedCarrierKinds, ",")),
 		)
 	}
-	if err := a.forwardResponses(w, r, turnID, plan, parsed, now); err != nil {
+	result, err := a.forwardResponses(w, r, turnID, turnPK, plan, parsed, now)
+	if err != nil {
 		a.logger.Error("forward response", logging.Err(err), logging.String("turn_id", turnID))
 	}
+	if updateErr := a.sqlite.UpdateTurnResult(r.Context(), turnID, result.StatusCode, result.ErrorCode, result.ErrorMessage, turnPK); updateErr != nil {
+		a.logger.Error("update turn result", logging.Err(updateErr), logging.String("turn_id", turnID))
+	}
+	if archiveErr := a.archiveTurn(r.Context(), turnPK, turnID, plan, result, now); archiveErr != nil {
+		a.logger.Error("archive turn", logging.Err(archiveErr), logging.String("turn_id", turnID))
+	}
+}
+
+type forwardResult struct {
+	StatusCode    int
+	ErrorCode     string
+	ErrorMessage  string
+	ResponseItems []map[string]any
+	StreamState   string
+	FinishReason  string
 }
 
 func (a *App) planRoute(ctx context.Context, parsed responses.Request, now time.Time) (routePlan, error) {
@@ -115,6 +134,7 @@ func (a *App) planRoute(ctx context.Context, parsed responses.Request, now time.
 			Account:          account,
 			LineageSessionID: ids.New("lineage"),
 			ForwardBody:      mustJSON(parsed.Raw),
+			ForwardMap:       parsed.Raw,
 		}, nil
 	}
 	hashed := make([]sqlitestore.HashedCarrier, 0, len(carriers))
@@ -142,6 +162,7 @@ func (a *App) planRoute(ctx context.Context, parsed responses.Request, now time.
 			HasRealCarrier:   true,
 			CarrierKinds:     responses.CarrierKinds(carriers),
 			ForwardBody:      mustJSON(parsed.Raw),
+			ForwardMap:       parsed.Raw,
 		}, nil
 	}
 	stripped, removedKinds, removedCount := responses.StripCarriers(parsed.Raw)
@@ -166,76 +187,150 @@ func (a *App) planRoute(ctx context.Context, parsed responses.Request, now time.
 		RemovedCarrierKinds: removedKinds,
 		RemovedCarrierCount: removedCount,
 		ForwardBody:         mustJSON(stripped),
+		ForwardMap:          stripped,
 	}, nil
 }
 
-func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, turnID string, plan routePlan, parsed responses.Request, now time.Time) error {
+func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, turnID, turnPK string, plan routePlan, parsed responses.Request, now time.Time) (forwardResult, error) {
 	upstreamURL := fmt.Sprintf("http://%s:%d/v1/responses", plan.Account.DownstreamHost, plan.Account.DownstreamPort)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(plan.ForwardBody))
 	if err != nil {
-		return err
+		return forwardResult{}, err
 	}
 	copyHeaders(req.Header, r.Header)
 	resp, err := a.client.Do(req)
 	if err != nil {
 		_ = a.sqlite.InsertRoutingFailure(r.Context(), ids.New("failure"), turnID, plan.LineageSessionID, plan.Account.AccountID, "upstream_request_failed", err.Error(), http.StatusBadGateway, now)
 		writeJSONError(w, http.StatusBadGateway, "upstream_request_failed", err.Error())
-		return nil
+		return forwardResult{StatusCode: http.StatusBadGateway, ErrorCode: "upstream_request_failed", ErrorMessage: err.Error()}, nil
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
+	if isStreamingRequest(plan.ForwardMap) {
+		return a.forwardStreamingResponses(w, resp, r.Context(), turnID, plan, now)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return forwardResult{}, err
+	}
 	_, _ = w.Write(body)
-
 	if resp.StatusCode >= 400 {
 		_ = a.sqlite.InsertRoutingFailure(r.Context(), ids.New("failure"), turnID, plan.LineageSessionID, plan.Account.AccountID, "upstream_rejected", string(body), resp.StatusCode, now)
-		return nil
+		return forwardResult{StatusCode: resp.StatusCode, ErrorCode: "upstream_rejected", ErrorMessage: string(body)}, nil
 	}
-	responseCarriers := extractResponseCarriers(body)
-	if len(responseCarriers) > 0 {
-		hashed := make([]sqlitestore.HashedCarrier, 0, len(responseCarriers))
-		for _, carrier := range responseCarriers {
-			hashed = append(hashed, sqlitestore.HashedCarrier{Kind: carrier.Kind, IDHMAC: a.hasher.Sum(carrier.RealID), BlobHMAC: a.hasher.Sum(carrier.EncryptedContent)})
-		}
-		if err := a.sqlite.UpsertCarrierBindings(r.Context(), plan.LineageSessionID, turnID, plan.Account, hashed, now); err != nil {
-			a.logger.Error("upsert carrier bindings", logging.Err(err), logging.String("turn_id", turnID))
-		}
+	responseItems := responses.ResponseItems(mustParseMap(body))
+	if err := a.upsertResponseCarriers(r.Context(), turnID, plan, now, extractResponseCarriers(body)); err != nil {
+		a.logger.Error("upsert carrier bindings", logging.Err(err), logging.String("turn_id", turnID))
 	}
 	if plan.Mode == "replay" {
 		_ = a.sqlite.InsertReplayEvent(r.Context(), ids.New("replay"), turnID, turnID, plan.LineageSessionID, "", plan.Account.AccountID, plan.ReasonCode, strings.Join(plan.RemovedCarrierKinds, ","), plan.RemovedCarrierCount, now)
 	}
-	return nil
+	return forwardResult{StatusCode: resp.StatusCode, ResponseItems: responseItems, StreamState: "completed"}, nil
+}
+
+func (a *App) forwardStreamingResponses(w http.ResponseWriter, resp *http.Response, ctx context.Context, turnID string, plan routePlan, now time.Time) (forwardResult, error) {
+	flusher, _ := w.(http.Flusher)
+	reader := bufio.NewReader(resp.Body)
+	collector := responses.NewStreamCollector()
+	for {
+		line, err := reader.ReadString('\n')
+		if line != "" {
+			_, _ = io.WriteString(w, line)
+			collector.ObserveEventLine(strings.TrimRight(line, "\r\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			collector.MarkInterrupted()
+			return forwardResult{StatusCode: resp.StatusCode, ErrorCode: "stream_read_failed", ErrorMessage: err.Error(), ResponseItems: collector.ResponseItems(), StreamState: collector.StreamState(), FinishReason: collector.FinishReason()}, nil
+		}
+		select {
+		case <-ctx.Done():
+			collector.MarkInterrupted()
+			return forwardResult{StatusCode: resp.StatusCode, ErrorCode: "client_cancelled", ErrorMessage: ctx.Err().Error(), ResponseItems: collector.ResponseItems(), StreamState: collector.StreamState(), FinishReason: collector.FinishReason()}, nil
+		default:
+		}
+	}
+	if resp.StatusCode >= 400 {
+		return forwardResult{StatusCode: resp.StatusCode, ErrorCode: "upstream_rejected", ResponseItems: collector.ResponseItems(), StreamState: collector.StreamState(), FinishReason: collector.FinishReason()}, nil
+	}
+	if err := a.upsertResponseCarriers(ctx, turnID, plan, now, collector.Carriers()); err != nil {
+		a.logger.Error("upsert stream carrier bindings", logging.Err(err), logging.String("turn_id", turnID))
+	}
+	if plan.Mode == "replay" {
+		_ = a.sqlite.InsertReplayEvent(ctx, ids.New("replay"), turnID, turnID, plan.LineageSessionID, "", plan.Account.AccountID, plan.ReasonCode, strings.Join(plan.RemovedCarrierKinds, ","), plan.RemovedCarrierCount, now)
+	}
+	return forwardResult{StatusCode: resp.StatusCode, ResponseItems: collector.ResponseItems(), StreamState: collector.StreamState(), FinishReason: collector.FinishReason()}, nil
+}
+
+func (a *App) upsertResponseCarriers(ctx context.Context, turnID string, plan routePlan, now time.Time, carriers []responses.Carrier) error {
+	if len(carriers) == 0 {
+		return nil
+	}
+	hashed := make([]sqlitestore.HashedCarrier, 0, len(carriers))
+	for _, carrier := range carriers {
+		hashed = append(hashed, sqlitestore.HashedCarrier{Kind: carrier.Kind, IDHMAC: a.hasher.Sum(carrier.RealID), BlobHMAC: a.hasher.Sum(carrier.EncryptedContent)})
+	}
+	return a.sqlite.UpsertCarrierBindings(ctx, plan.LineageSessionID, turnID, plan.Account, hashed, now)
+}
+
+func (a *App) archiveTurn(ctx context.Context, turnPK, turnID string, plan routePlan, result forwardResult, now time.Time) error {
+	reqItems := responses.RequestItems(plan.ForwardMap)
+	resItems := responses.MustItems(result.ResponseItems)
+	return a.duck.ArchiveTurn(ctx,
+		duckstore.TurnRecord{
+			TurnPK:              turnPK,
+			TurnID:              turnID,
+			LineageSessionID:    plan.LineageSessionID,
+			LineageGeneration:   plan.LineageGeneration,
+			RouteMode:           plan.Mode,
+			Surface:             "responses",
+			Model:               stringValue(plan.ForwardMap, "model"),
+			AccountID:           plan.Account.AccountID,
+			DownstreamHost:      plan.Account.DownstreamHost,
+			DownstreamPort:      plan.Account.DownstreamPort,
+			HasRealCarrier:      plan.HasRealCarrier,
+			CarrierKinds:        strings.Join(plan.CarrierKinds, ","),
+			CarrierRemoved:      plan.RemovedCarrierCount > 0,
+			RemovedCarrierKinds: strings.Join(plan.RemovedCarrierKinds, ","),
+			RemovedCarrierCount: plan.RemovedCarrierCount,
+			StreamState:         result.StreamState,
+			FinishReason:        result.FinishReason,
+			CreatedAt:           now,
+		},
+		duckstore.TurnDocument{
+			TurnPK:                turnPK,
+			TurnID:                turnID,
+			LineageSessionID:      plan.LineageSessionID,
+			RouteMode:             plan.Mode,
+			EffectiveRequestItems: reqItems,
+			ResponseItems:         resItems,
+			EffectiveConversation: responses.EffectiveConversationText(reqItems, resItems),
+			CreatedAt:             now,
+		},
+		responses.FlattenItems(turnPK, turnID, plan.LineageSessionID, reqItems, resItems),
+	)
 }
 
 func extractResponseCarriers(body []byte) []responses.Carrier {
+	return responses.ExtractRealCarriers(map[string]any{"input": mustParseMap(body)["output"]})
+}
+
+func isStreamingRequest(raw map[string]any) bool {
+	v, ok := raw["stream"].(bool)
+	return ok && v
+}
+
+func mustParseMap(body []byte) map[string]any {
 	var raw map[string]any
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil
-	}
-	items, _ := raw["output"].([]any)
-	out := make([]responses.Carrier, 0)
-	for _, item := range items {
-		m, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		kind, _ := m["type"].(string)
-		if kind != "reasoning" && kind != "compaction" {
-			continue
-		}
-		realID, _ := m["id"].(string)
-		encrypted, _ := m["encrypted_content"].(string)
-		if realID == "" && encrypted == "" {
-			continue
-		}
-		out = append(out, responses.Carrier{Kind: kind, RealID: realID, EncryptedContent: encrypted})
-	}
-	return out
+	_ = json.Unmarshal(body, &raw)
+	return raw
 }
 
 func copyHeaders(dst, src http.Header) {
