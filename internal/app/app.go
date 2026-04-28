@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/nolanho/llm-api-gateway/internal/config"
 	"github.com/nolanho/llm-api-gateway/internal/logging"
+	"github.com/nolanho/llm-api-gateway/internal/security"
 	"github.com/nolanho/llm-api-gateway/internal/storage/duckstore"
 	"github.com/nolanho/llm-api-gateway/internal/storage/sqlitestore"
 	"go.uber.org/zap"
@@ -21,6 +23,8 @@ type App struct {
 	sqlite *sqlitestore.Store
 	duck   *duckstore.Store
 	mux    *http.ServeMux
+	client *http.Client
+	hasher security.CarrierHasher
 }
 
 func New(ctx context.Context, cfg config.Config, logger *zap.Logger) (*App, error) {
@@ -40,6 +44,11 @@ func New(ctx context.Context, cfg config.Config, logger *zap.Logger) (*App, erro
 		_ = sqliteStore.Close(ctx)
 		return nil, fmt.Errorf("open duckdb: %w", err)
 	}
+	if err := seedAccounts(ctx, cfg, sqliteStore); err != nil {
+		_ = duckStore.Close(ctx)
+		_ = sqliteStore.Close(ctx)
+		return nil, fmt.Errorf("seed accounts: %w", err)
+	}
 
 	a := &App{
 		cfg:    cfg,
@@ -47,6 +56,8 @@ func New(ctx context.Context, cfg config.Config, logger *zap.Logger) (*App, erro
 		sqlite: sqliteStore,
 		duck:   duckStore,
 		mux:    http.NewServeMux(),
+		client: &http.Client{Timeout: cfg.UpstreamTimeout},
+		hasher: security.NewCarrierHasher(cfg.CarrierHMACKey),
 	}
 	a.routes()
 	logger.Info("storage initialized",
@@ -56,6 +67,21 @@ func New(ctx context.Context, cfg config.Config, logger *zap.Logger) (*App, erro
 		logging.Int64("inactive_session_retention_ms", cfg.InactiveSessionRetain.Milliseconds()),
 	)
 	return a, nil
+}
+
+func seedAccounts(ctx context.Context, cfg config.Config, sqliteStore *sqlitestore.Store) error {
+	if cfg.AccountsFile == "" {
+		return nil
+	}
+	body, err := os.ReadFile(cfg.AccountsFile)
+	if err != nil {
+		return err
+	}
+	var accounts []sqlitestore.Account
+	if err := json.Unmarshal(body, &accounts); err != nil {
+		return fmt.Errorf("decode accounts file: %w", err)
+	}
+	return sqliteStore.UpsertAccounts(ctx, accounts, time.Now().UTC())
 }
 
 func (a *App) routes() {
@@ -77,6 +103,7 @@ func (a *App) routes() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ready"}`))
 	})
+	a.mux.HandleFunc("/v1/responses", a.handleResponses)
 }
 
 func (a *App) Handler() http.Handler { return a.mux }

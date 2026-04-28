@@ -12,6 +12,9 @@ type Config struct {
 	LogJSON               bool
 	SQLitePath            string
 	DuckDBPath            string
+	AccountsFile          string
+	CarrierHMACKey        string
+	UpstreamTimeout       time.Duration
 	ActiveSessionWindow   time.Duration
 	InactiveSessionRetain time.Duration
 	DefaultReplayEnabled  bool
@@ -24,6 +27,9 @@ func Load() (Config, error) {
 		LogJSON:               getenvBool("LLM_GATEWAY_LOG_JSON", true),
 		SQLitePath:            getenv("LLM_GATEWAY_SQLITE_PATH", "var/llm-api-gateway.sqlite3"),
 		DuckDBPath:            getenv("LLM_GATEWAY_DUCKDB_PATH", "var/llm-api-gateway.duckdb"),
+		AccountsFile:          getenv("LLM_GATEWAY_ACCOUNTS_FILE", ""),
+		CarrierHMACKey:        getenv("LLM_GATEWAY_CARRIER_HMAC_KEY", "dev-only-unsafe-key"),
+		UpstreamTimeout:       getenvDuration("LLM_GATEWAY_UPSTREAM_TIMEOUT", 5*time.Minute),
 		ActiveSessionWindow:   getenvDuration("LLM_GATEWAY_ACTIVE_WINDOW", 30*time.Minute),
 		InactiveSessionRetain: getenvDuration("LLM_GATEWAY_SESSION_RETENTION", 14*24*time.Hour),
 		DefaultReplayEnabled:  getenvBool("LLM_GATEWAY_REPLAY_ENABLED", true),
@@ -34,6 +40,12 @@ func Load() (Config, error) {
 	}
 	if cfg.InactiveSessionRetain < cfg.ActiveSessionWindow {
 		return Config{}, fmt.Errorf("inactive session retention must be >= active session window")
+	}
+	if cfg.CarrierHMACKey == "" {
+		return Config{}, fmt.Errorf("carrier hmac key must not be empty")
+	}
+	if cfg.UpstreamTimeout <= 0 {
+		return Config{}, fmt.Errorf("upstream timeout must be positive")
 	}
 	return cfg, nil
 }
