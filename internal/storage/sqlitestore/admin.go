@@ -128,7 +128,7 @@ func (s *Store) GetAccountOverview(ctx context.Context, accountID string, now ti
 	overview.ActiveSessionCount, _ = s.countInt64(ctx, `SELECT COUNT(DISTINCT lineage_session_id) FROM lineage_bindings WHERE account_id = ? AND last_seen_at_ms >= ? AND retained_until_ms >= ?`, accountID, activeCutoff, now.UnixMilli())
 	overview.ActiveCarrierCount, _ = s.countInt64(ctx, `SELECT COUNT(*) FROM carrier_index WHERE owner_account_id = ? AND last_seen_at_ms >= ?`, accountID, activeCutoff)
 	overview.RecentReplayCount, _ = s.countInt64(ctx, `SELECT COUNT(*) FROM replay_events WHERE new_account_id = ? AND created_at_ms >= ?`, accountID, replayCutoff)
-	turns, err := s.listTurnsByQuery(ctx, `SELECT turn_id, lineage_session_id, route_mode, error_code, carrier_kinds, removed_carrier_kinds, request_status_code, created_at_ms FROM turns_meta WHERE account_id = ? ORDER BY created_at_ms DESC LIMIT ?`, accountID, recentTurnsLimit)
+	turns, err := s.listTurnsByQuery(ctx, `SELECT turn_id, lineage_session_id, route_mode, COALESCE(error_code,''), COALESCE(carrier_kinds,''), COALESCE(removed_carrier_kinds,''), COALESCE(request_status_code,0), created_at_ms FROM turns_meta WHERE account_id = ? ORDER BY created_at_ms DESC LIMIT ?`, accountID, recentTurnsLimit)
 	if err != nil {
 		return overview, err
 	}
@@ -150,7 +150,7 @@ func (s *Store) GetLineageDetail(ctx context.Context, lineageSessionID string, l
 		return detail, err
 	}
 	detail.Carriers = carriers
-	turns, err := s.listTurnsByQuery(ctx, `SELECT turn_id, lineage_session_id, route_mode, error_code, carrier_kinds, removed_carrier_kinds, request_status_code, created_at_ms FROM turns_meta WHERE lineage_session_id = ? ORDER BY created_at_ms ASC LIMIT ?`, lineageSessionID, limit)
+	turns, err := s.listTurnsByQuery(ctx, `SELECT turn_id, lineage_session_id, route_mode, COALESCE(error_code,''), COALESCE(carrier_kinds,''), COALESCE(removed_carrier_kinds,''), COALESCE(request_status_code,0), created_at_ms FROM turns_meta WHERE lineage_session_id = ? ORDER BY created_at_ms ASC LIMIT ?`, lineageSessionID, limit)
 	if err != nil {
 		return detail, err
 	}
