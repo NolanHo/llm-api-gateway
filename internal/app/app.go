@@ -114,6 +114,7 @@ func (a *App) routes() {
 		_, _ = w.Write([]byte(`{"status":"ready"}`))
 	})
 	a.mux.Handle("/metrics", a.telemetry.Handler)
+	a.registerAdminRoutes()
 	a.mux.HandleFunc("/v1/responses", a.handleResponses)
 }
 
