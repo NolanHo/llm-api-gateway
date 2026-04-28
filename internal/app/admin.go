@@ -84,9 +84,10 @@ h3 { margin: 16px 0 10px; font-size: 14px; }
 .load-sub { margin-top: 3px; color: var(--muted); font-size: 12px; }
 .load-bars { display: grid; gap: 7px; }
 .load-bar { display: grid; grid-template-columns: 70px 1fr 42px; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; }
-.load-track { height: 8px; border-radius: 999px; background: #eef2ff; overflow: hidden; }
+.load-track { position: relative; height: 18px; border-radius: 999px; background: #eef2ff; overflow: hidden; }
 .load-fill { height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2563eb, #7c3aed); }
 .load-fill.replay { background: linear-gradient(90deg, #059669, #10b981); }
+.load-percent { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #1f2937; font-size: 11px; font-weight: 760; text-shadow: 0 1px 0 rgba(255,255,255,.72); }
 .load-score { min-width: 52px; text-align: right; font-weight: 760; }
 .account-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; }
 .account-card { border: 1px solid var(--line); border-radius: 16px; background: white; padding: 14px; }
@@ -284,6 +285,10 @@ function pct(value, max) {
   if (max <= 0) return 0;
   return Math.max(0, Math.min(100, Math.round(value * 100 / max)));
 }
+function loadTrack(value, max, cls) {
+  const p = pct(value, max);
+  return '<div class="load-track"><div class="load-fill ' + escapeHTML(cls || '') + '" style="width:' + p + '%"></div><div class="load-percent">' + p + '%</div></div>';
+}
 function renderLoad(accounts) {
   if (!accounts.length) return '<div class="empty">empty</div>';
   const maxScore = Math.max(1, ...accounts.map(loadScore));
@@ -294,9 +299,9 @@ function renderLoad(accounts) {
     const score = loadScore(a);
     return '<div class="load-row"><div><div class="load-name">' + escapeHTML(a.display_name) + '</div><div class="load-sub">' + escapeHTML(a.account_id) + ' / :' + escapeHTML(a.downstream_port) + '</div></div>' +
       '<div class="load-bars">' +
-        '<div class="load-bar"><span>score</span><div class="load-track"><div class="load-fill" style="width:' + pct(score, maxScore) + '%"></div></div><span>' + fmt(score) + '</span></div>' +
-        '<div class="load-bar"><span>turns</span><div class="load-track"><div class="load-fill" style="width:' + pct(a.recent_turn_count, maxTurns) + '%"></div></div><span>' + fmt(a.recent_turn_count) + '</span></div>' +
-        '<div class="load-bar"><span>replay</span><div class="load-track"><div class="load-fill replay" style="width:' + pct(a.recent_replay_count, maxReplays) + '%"></div></div><span>' + fmt(a.recent_replay_count) + '</span></div>' +
+        '<div class="load-bar"><span>score</span>' + loadTrack(score, maxScore, '') + '<span>' + fmt(score) + '</span></div>' +
+        '<div class="load-bar"><span>turns</span>' + loadTrack(a.recent_turn_count, maxTurns, '') + '<span>' + fmt(a.recent_turn_count) + '</span></div>' +
+        '<div class="load-bar"><span>replay</span>' + loadTrack(a.recent_replay_count, maxReplays, 'replay') + '<span>' + fmt(a.recent_replay_count) + '</span></div>' +
       '</div><div class="load-score">' + badge('sessions ' + fmt(a.active_sessions), a.active_sessions > 0 ? 'warn' : '') + '</div></div>';
   }).join('') + '</div>';
 }
