@@ -72,6 +72,10 @@ func (s *Store) UpsertAccounts(ctx context.Context, accounts []Account, now time
 }
 
 func (s *Store) SelectLeastActiveAccount(ctx context.Context, model string, now time.Time) (Account, error) {
+	return s.SelectLeastActiveAccountExcluding(ctx, model, now, nil)
+}
+
+func (s *Store) SelectLeastActiveAccountExcluding(ctx context.Context, model string, now time.Time, excluded map[string]struct{}) (Account, error) {
 	if err := s.RefreshAccountCooldowns(ctx, now); err != nil {
 		return Account{}, err
 	}
@@ -103,6 +107,9 @@ func (s *Store) SelectLeastActiveAccount(ctx context.Context, model string, now 
 			return Account{}, fmt.Errorf("decode model allowlist: %w", err)
 		}
 		if len(a.ModelAllowlist) > 0 && model != "" && !contains(a.ModelAllowlist, model) {
+			continue
+		}
+		if _, skip := excluded[a.AccountID]; skip {
 			continue
 		}
 		candidates = append(candidates, struct {

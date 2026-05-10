@@ -190,12 +190,9 @@ func TestAccountDisableAndCooldown(t *testing.T) {
 	defer gateway.Close()
 
 	body := map[string]any{"model": "gpt-5.4-mini", "input": []map[string]any{{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "hello"}}}}}
-	if status := doJSONStatus(t, gateway.Client(), gateway.URL+"/v1/responses", body); status != http.StatusTooManyRequests {
-		t.Fatalf("expected first request to hit rate limited account, got %d", status)
-	}
 	_ = doJSON(t, gateway.Client(), gateway.URL+"/v1/responses", body)
 	if len(good.Requests()) != 1 {
-		t.Fatalf("expected cooldown to route next request to good account, got %d", len(good.Requests()))
+		t.Fatalf("expected retry to route first request to good account, got %d", len(good.Requests()))
 	}
 
 	req, err := http.NewRequest(http.MethodPost, gateway.URL+"/admin/api/accounts/acc_good/disable", nil)
@@ -226,6 +223,161 @@ func TestAccountDisableAndCooldown(t *testing.T) {
 	}
 	if !seenDisabled || !seenCooldown {
 		t.Fatalf("expected disabled/cooldown states, got %#v", metrics.Accounts)
+	}
+}
+
+func TestNonStreamingRetryRecoversFromRateLimitAndHTML(t *testing.T) {
+	ctx := context.Background()
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`<html>temporary gateway error</html>`))
+	}))
+	defer bad.Close()
+	limited := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+	}))
+	defer limited.Close()
+	good := newFakeDownstream(t, "good")
+	defer good.Close()
+	badHost, badPort := splitHostPort(bad.URL)
+	limitedHost, limitedPort := splitHostPort(limited.URL)
+	cfg := testConfig(t, []sqlitestore.Account{
+		{AccountID: "acc_bad_html", ProviderKind: "copilot-api", DisplayName: "bad-html", DownstreamHost: badHost, DownstreamPort: badPort, Enabled: true, State: "running"},
+		{AccountID: "acc_limited", ProviderKind: "copilot-api", DisplayName: "limited", DownstreamHost: limitedHost, DownstreamPort: limitedPort, Enabled: true, State: "running"},
+		accountFromDownstream("acc_good", good),
+	})
+	cfg.RetryBackoff = 0
+	logger, err := logging.New(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = logger.Sync() }()
+	app, err := New(ctx, cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = app.Close(ctx) }()
+	gateway := httptest.NewServer(app.Handler())
+	defer gateway.Close()
+
+	body := map[string]any{"model": "gpt-5.4-mini", "input": []map[string]any{{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "hello"}}}}}
+	resp := doJSON(t, gateway.Client(), gateway.URL+"/v1/responses", body)
+	if text := resp["output"].([]any)[1].(map[string]any)["content"].([]any)[0].(map[string]any)["text"]; text != "ok-good" {
+		t.Fatalf("expected good response after retries, got %#v", resp)
+	}
+	if len(good.Requests()) != 1 {
+		t.Fatalf("expected final retry to reach good account, got %d", len(good.Requests()))
+	}
+}
+
+func TestStrictOwnerRetryDoesNotCrossAccountByDefault(t *testing.T) {
+	ctx := context.Background()
+	var ownerRequestsMu sync.Mutex
+	var ownerRequests []map[string]any
+	ownerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var raw map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		ownerRequestsMu.Lock()
+		ownerRequests = append(ownerRequests, raw)
+		ownerRequestsMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+	}))
+	defer ownerServer.Close()
+	other := newFakeDownstream(t, "other")
+	defer other.Close()
+	ownerHost, ownerPort := splitHostPort(ownerServer.URL)
+	cfg := testConfig(t, []sqlitestore.Account{
+		{AccountID: "acc_owner", ProviderKind: "copilot-api", DisplayName: "owner", DownstreamHost: ownerHost, DownstreamPort: ownerPort, Enabled: true, State: "running"},
+		accountFromDownstream("acc_other", other),
+	})
+	cfg.RetryMaxAttempts = 2
+	cfg.RetryBackoff = 0
+	logger, err := logging.New(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = logger.Sync() }()
+	app, err := New(ctx, cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = app.Close(ctx) }()
+	gateway := httptest.NewServer(app.Handler())
+	defer gateway.Close()
+
+	if err := app.sqlite.UpsertCarrierBindings(ctx, "lineage_owner", "turn_seed", cfgAccount("acc_owner", ownerHost, ownerPort), []sqlitestore.HashedCarrier{{Kind: "reasoning", IDHMAC: app.hasher.Sum("rs_owner"), BlobHMAC: app.hasher.Sum("enc_owner")}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	strictReq := map[string]any{"model": "gpt-5.4-mini", "input": []any{
+		map[string]any{"type": "reasoning", "id": "rs_owner", "encrypted_content": "enc_owner", "summary": []map[string]any{{"type": "summary_text", "text": "thinking"}}},
+		map[string]any{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "followup"}}},
+	}}
+	status := doJSONStatus(t, gateway.Client(), gateway.URL+"/v1/responses", strictReq)
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("expected strict owner rate limit to fail without strict replay retry, got %d", status)
+	}
+	if got := len(other.Requests()); got != 0 {
+		t.Fatalf("strict retry default must not reach other account, got %d requests", got)
+	}
+	ownerRequestsMu.Lock()
+	ownerCount := len(ownerRequests)
+	ownerRequestsMu.Unlock()
+	if ownerCount != 1 {
+		t.Fatalf("expected one strict owner attempt, got %d", ownerCount)
+	}
+}
+
+func TestStrictOwnerRetryCanStripCarrierWhenEnabled(t *testing.T) {
+	ctx := context.Background()
+	ownerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+	}))
+	defer ownerServer.Close()
+	other := newFakeDownstream(t, "other")
+	defer other.Close()
+	ownerHost, ownerPort := splitHostPort(ownerServer.URL)
+	cfg := testConfig(t, []sqlitestore.Account{
+		{AccountID: "acc_owner", ProviderKind: "copilot-api", DisplayName: "owner", DownstreamHost: ownerHost, DownstreamPort: ownerPort, Enabled: true, State: "running"},
+		accountFromDownstream("acc_other", other),
+	})
+	cfg.RetryMaxAttempts = 2
+	cfg.RetryBackoff = 0
+	cfg.StrictReplayRetry = true
+	logger, err := logging.New(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = logger.Sync() }()
+	app, err := New(ctx, cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = app.Close(ctx) }()
+	gateway := httptest.NewServer(app.Handler())
+	defer gateway.Close()
+
+	if err := app.sqlite.UpsertCarrierBindings(ctx, "lineage_owner", "turn_seed", cfgAccount("acc_owner", ownerHost, ownerPort), []sqlitestore.HashedCarrier{{Kind: "reasoning", IDHMAC: app.hasher.Sum("rs_owner"), BlobHMAC: app.hasher.Sum("enc_owner")}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	strictReq := map[string]any{"model": "gpt-5.4-mini", "input": []any{
+		map[string]any{"type": "reasoning", "id": "rs_owner", "encrypted_content": "enc_owner", "summary": []map[string]any{{"type": "summary_text", "text": "thinking"}}},
+		map[string]any{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "followup"}}},
+	}}
+	_ = doJSON(t, gateway.Client(), gateway.URL+"/v1/responses", strictReq)
+	if got := len(other.Requests()); got != 1 {
+		t.Fatalf("expected strict replay retry to reach other account, got %d", got)
+	}
+	for _, item := range other.Requests()[0]["input"].([]any) {
+		if m, ok := item.(map[string]any); ok && m["type"] == "reasoning" {
+			t.Fatalf("strict replay retry leaked carrier to other account: %#v", other.Requests()[0])
+		}
 	}
 }
 
@@ -392,12 +544,16 @@ func testConfig(t *testing.T, accounts []sqlitestore.Account) config.Config {
 		ListenAddr: ":0", LogJSON: true, ServiceName: "test-gateway", OTELStdout: false,
 		SQLitePath: filepath.Join(dir, "gateway.sqlite3"), DuckDBPath: filepath.Join(dir, "gateway.duckdb"), AccountsFile: accountsPath,
 		CarrierHMACKey: "test-secret", UpstreamTimeout: 10 * time.Second, ActiveSessionWindow: 30 * time.Minute, InactiveSessionRetain: 14 * 24 * time.Hour,
-		DefaultReplayEnabled: true, DefaultProviderKind: "copilot-api",
+		DefaultReplayEnabled: true, DefaultProviderKind: "copilot-api", RetryMaxAttempts: 8, RetryBackoff: 200 * time.Millisecond,
 	}
 }
 
 func accountFromDownstream(id string, ds *fakeDownstream) sqlitestore.Account {
 	host, port := ds.Addr()
+	return cfgAccount(id, host, port)
+}
+
+func cfgAccount(id, host string, port int) sqlitestore.Account {
 	return sqlitestore.Account{AccountID: id, ProviderKind: "copilot-api", DisplayName: id, DownstreamHost: host, DownstreamPort: port, Enabled: true, State: "running"}
 }
 

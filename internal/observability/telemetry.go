@@ -29,6 +29,7 @@ type Telemetry struct {
 type Metrics struct {
 	UpstreamRequests      metric.Int64Counter
 	UpstreamFailures      metric.Int64Counter
+	RetryAttempts         metric.Int64Counter
 	ReplayTotal           metric.Int64Counter
 	CarrierWrites         metric.Int64Counter
 	ArchiveFailures       metric.Int64Counter
@@ -143,6 +144,10 @@ func newMetrics(meter metric.Meter) (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	retryAttempts, err := meter.Int64Counter("gateway_retry_attempts_total")
+	if err != nil {
+		return nil, err
+	}
 	replayTotal, err := meter.Int64Counter("gateway_replay_total")
 	if err != nil {
 		return nil, err
@@ -234,6 +239,7 @@ func newMetrics(meter metric.Meter) (*Metrics, error) {
 	return &Metrics{
 		UpstreamRequests:      upstreamRequests,
 		UpstreamFailures:      upstreamFailures,
+		RetryAttempts:         retryAttempts,
 		ReplayTotal:           replayTotal,
 		CarrierWrites:         carrierWrites,
 		ArchiveFailures:       archiveFailures,

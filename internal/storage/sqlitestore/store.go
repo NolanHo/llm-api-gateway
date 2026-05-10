@@ -139,6 +139,24 @@ func (s *Store) migrate(ctx context.Context) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_routing_failures_lineage ON routing_failures(lineage_session_id, created_at_ms);`,
 		`CREATE INDEX IF NOT EXISTS idx_routing_failures_reason ON routing_failures(reason_code, created_at_ms);`,
+		`CREATE TABLE IF NOT EXISTS retry_attempts (
+			retry_attempt_id TEXT PRIMARY KEY,
+			turn_id TEXT NOT NULL,
+			lineage_session_id TEXT NOT NULL,
+			attempt INTEGER NOT NULL,
+			max_attempts INTEGER NOT NULL,
+			account_id TEXT,
+			route_mode TEXT NOT NULL,
+			reason_code TEXT NOT NULL,
+			reason_detail TEXT,
+			http_status INTEGER,
+			retryable INTEGER NOT NULL,
+			next_account_id TEXT,
+			created_at_ms INTEGER NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_retry_attempts_turn ON retry_attempts(turn_id, attempt);`,
+		`CREATE INDEX IF NOT EXISTS idx_retry_attempts_lineage ON retry_attempts(lineage_session_id, created_at_ms);`,
+		`CREATE INDEX IF NOT EXISTS idx_retry_attempts_reason ON retry_attempts(reason_code, created_at_ms);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {

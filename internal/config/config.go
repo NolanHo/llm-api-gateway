@@ -22,6 +22,9 @@ type Config struct {
 	DefaultReplayEnabled  bool
 	DefaultProviderKind   string
 	AccessToken           string
+	RetryMaxAttempts      int
+	RetryBackoff          time.Duration
+	StrictReplayRetry     bool
 }
 
 func Load() (Config, error) {
@@ -40,6 +43,9 @@ func Load() (Config, error) {
 		DefaultReplayEnabled:  getenvBool("LLM_GATEWAY_REPLAY_ENABLED", true),
 		DefaultProviderKind:   getenv("LLM_GATEWAY_PROVIDER_KIND", "copilot-api"),
 		AccessToken:           getenv("LLM_GATEWAY_ACCESS_TOKEN", ""),
+		RetryMaxAttempts:      getenvInt("LLM_GATEWAY_RETRY_MAX_ATTEMPTS", 8),
+		RetryBackoff:          getenvDuration("LLM_GATEWAY_RETRY_BACKOFF", 200*time.Millisecond),
+		StrictReplayRetry:     getenvBool("LLM_GATEWAY_STRICT_REPLAY_RETRY", false),
 	}
 	if cfg.ActiveSessionWindow <= 0 {
 		return Config{}, fmt.Errorf("active session window must be positive")
@@ -52,6 +58,12 @@ func Load() (Config, error) {
 	}
 	if cfg.UpstreamTimeout <= 0 {
 		return Config{}, fmt.Errorf("upstream timeout must be positive")
+	}
+	if cfg.RetryMaxAttempts < 1 {
+		return Config{}, fmt.Errorf("retry max attempts must be >= 1")
+	}
+	if cfg.RetryBackoff < 0 {
+		return Config{}, fmt.Errorf("retry backoff must be >= 0")
 	}
 	return cfg, nil
 }
@@ -78,6 +90,16 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		d, err := time.ParseDuration(v)
 		if err == nil {
 			return d
+		}
+	}
+	return fallback
+}
+
+func getenvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		i, err := strconv.Atoi(v)
+		if err == nil {
+			return i
 		}
 	}
 	return fallback

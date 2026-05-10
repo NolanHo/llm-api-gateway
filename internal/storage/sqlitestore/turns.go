@@ -32,6 +32,22 @@ type TurnMeta struct {
 	CreatedAt              time.Time
 }
 
+type RetryAttempt struct {
+	RetryAttemptID   string
+	TurnID           string
+	LineageSessionID string
+	Attempt          int
+	MaxAttempts      int
+	AccountID        string
+	RouteMode        string
+	ReasonCode       string
+	ReasonDetail     string
+	HTTPStatus       int
+	Retryable        bool
+	NextAccountID    string
+	CreatedAt        time.Time
+}
+
 func (s *Store) InsertTurnMeta(ctx context.Context, turn TurnMeta) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO turns_meta (
 		turn_id, parent_turn_id, replay_parent_turn_id, lineage_session_id, lineage_generation,
@@ -61,6 +77,17 @@ func (s *Store) InsertRoutingFailure(ctx context.Context, failureID, turnID, lin
 	_, err := s.db.ExecContext(ctx, `INSERT INTO routing_failures (
 		failure_id, turn_id, lineage_session_id, account_id, reason_code, reason_detail, http_status, created_at_ms
 	) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, failureID, turnID, lineageSessionID, nullableString(accountID), reasonCode, nullableString(reasonDetail), zeroToNullInt(httpStatus), now.UnixMilli())
+	return err
+}
+
+func (s *Store) InsertRetryAttempt(ctx context.Context, attempt RetryAttempt) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO retry_attempts (
+		retry_attempt_id, turn_id, lineage_session_id, attempt, max_attempts, account_id,
+		route_mode, reason_code, reason_detail, http_status, retryable, next_account_id, created_at_ms
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		attempt.RetryAttemptID, attempt.TurnID, attempt.LineageSessionID, attempt.Attempt, attempt.MaxAttempts, nullableString(attempt.AccountID),
+		attempt.RouteMode, attempt.ReasonCode, nullableString(attempt.ReasonDetail), zeroToNullInt(attempt.HTTPStatus), boolToInt(attempt.Retryable), nullableString(attempt.NextAccountID), attempt.CreatedAt.UnixMilli(),
+	)
 	return err
 }
 

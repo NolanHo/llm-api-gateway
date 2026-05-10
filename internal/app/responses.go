@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -38,6 +40,14 @@ type routePlan struct {
 	ForwardBody         []byte
 	ForwardMap          map[string]any
 }
+
+type routeError struct {
+	Code   string
+	Detail string
+	Status int
+}
+
+func (e routeError) Error() string { return e.Detail }
 
 func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	ctx, span := a.telemetry.Tracer.Start(r.Context(), "gateway.request")
@@ -72,7 +82,11 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	plan, err := a.planRoute(ctx, parsed, now)
 	if err != nil {
-		a.writeRoutingError(w, r.WithContext(ctx), turnID, ids.New("lineage"), "route_plan_failed", err.Error(), http.StatusInternalServerError, now)
+		re := routeError{Code: "route_plan_failed", Detail: err.Error(), Status: http.StatusInternalServerError}
+		if errors.As(err, &re) {
+			// Use the typed route error fields below.
+		}
+		a.writeRoutingError(w, r.WithContext(ctx), turnID, ids.New("lineage"), re.Code, re.Detail, re.Status, now)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "route planning failed")
 		return
@@ -138,11 +152,15 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 			attribute.String("gateway.account.id", plan.Account.AccountID),
 		))
 	}
-	result, err := a.forwardResponses(w, r.WithContext(ctx), turnID, turnPK, plan, now)
+	result, finalPlan, err := a.forwardResponses(w, r.WithContext(ctx), turnID, turnPK, plan, now)
+	plan = finalPlan
 	if err != nil {
 		planLogger.Error("forward response", logging.Err(err))
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "forward response failed")
+	}
+	if updateErr := a.sqlite.UpdateTurnRoute(ctx, turnMetaFromPlan(turnID, plan)); updateErr != nil {
+		planLogger.Error("update turn route", logging.Err(updateErr))
 	}
 	if updateErr := a.sqlite.UpdateTurnResult(ctx, turnID, result.StatusCode, result.ErrorCode, result.ErrorMessage, turnPK); updateErr != nil {
 		planLogger.Error("update turn result", logging.Err(updateErr))
@@ -169,6 +187,24 @@ type forwardResult struct {
 	ResponseItems []map[string]any
 	StreamState   string
 	FinishReason  string
+}
+
+type upstreamFailure struct {
+	StatusCode   int
+	ErrorCode    string
+	ErrorMessage string
+	Header       http.Header
+	Body         []byte
+	Retryable    bool
+	PassThrough  bool
+}
+
+type upstreamSuccess struct {
+	StatusCode    int
+	Header        http.Header
+	Body          []byte
+	Raw           map[string]any
+	ResponseItems []map[string]any
 }
 
 func (a *App) planRoute(ctx context.Context, parsed responses.Request, now time.Time) (routePlan, error) {
@@ -214,6 +250,9 @@ func (a *App) planRoute(ctx context.Context, parsed responses.Request, now time.
 				ForwardBody:      mustJSON(parsed.Raw),
 				ForwardMap:       parsed.Raw,
 			}, nil
+		}
+		if !a.cfg.StrictReplayRetry || !a.cfg.DefaultReplayEnabled {
+			return routePlan{}, routeError{Code: "carrier_owner_unavailable", Detail: fmt.Sprintf("carrier owner %s is unavailable", owner.AccountID), Status: http.StatusServiceUnavailable}
 		}
 		stripped, removedKinds, removedCount := responses.StripCarriers(parsed.Raw)
 		fallback, selectErr := a.sqlite.SelectLeastActiveAccount(ctx, stringValue(parsed.Raw, "model"), now)
@@ -264,13 +303,85 @@ func (a *App) planRoute(ctx context.Context, parsed responses.Request, now time.
 	}, nil
 }
 
-func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, turnID, turnPK string, plan routePlan, now time.Time) (forwardResult, error) {
+func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, turnID, turnPK string, plan routePlan, now time.Time) (forwardResult, routePlan, error) {
+	if isStreamingRequest(plan.ForwardMap) {
+		return a.forwardStreamingWithRetry(w, r, turnID, plan, now)
+	}
+	return a.forwardNonStreamingWithRetry(w, r, turnID, plan, now)
+}
+
+func (a *App) forwardNonStreamingWithRetry(w http.ResponseWriter, r *http.Request, turnID string, plan routePlan, now time.Time) (forwardResult, routePlan, error) {
+	ctx, span := a.telemetry.Tracer.Start(r.Context(), "gateway.provider.invoke")
+	defer span.End()
+	maxAttempts := a.retryMaxAttempts()
+	excluded := map[string]struct{}{}
+	var lastFailure upstreamFailure
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		success, failure, err := a.forwardNonStreamingAttempt(ctx, r, turnID, plan, now)
+		if err != nil {
+			return forwardResult{}, plan, err
+		}
+		if failure.ErrorCode == "" {
+			copyHeaders(w.Header(), success.Header)
+			w.WriteHeader(success.StatusCode)
+			_, _ = w.Write(success.Body)
+			if err := a.upsertResponseCarriers(ctx, turnID, plan, now, extractResponseCarriers(success.Body)); err != nil {
+				a.logger.Error("upsert carrier bindings", logging.Err(err), logging.String("turn_id", turnID))
+			}
+			if plan.Mode == "replay" {
+				_ = a.sqlite.InsertReplayEvent(ctx, ids.New("replay"), turnID, turnID, plan.LineageSessionID, "", plan.Account.AccountID, plan.ReasonCode, strings.Join(plan.RemovedCarrierKinds, ","), plan.RemovedCarrierCount, now)
+				span.AddEvent("replay.completed", eventAttrs(turnID, plan.LineageSessionID, plan.Account.AccountID, success.StatusCode, plan.ReasonCode))
+			}
+			return forwardResult{StatusCode: success.StatusCode, ResponseItems: success.ResponseItems, StreamState: "completed"}, plan, nil
+		}
+		lastFailure = failure
+		excluded[plan.Account.AccountID] = struct{}{}
+		retryable := failure.Retryable && attempt < maxAttempts
+		var nextPlan routePlan
+		if retryable {
+			var ok bool
+			var err error
+			nextPlan, ok, err = a.nextRetryPlan(ctx, plan, excluded, failure, now)
+			if err != nil {
+				return forwardResult{}, plan, err
+			}
+			retryable = ok
+		}
+		nextAccountID := ""
+		if retryable {
+			nextAccountID = nextPlan.Account.AccountID
+		}
+		a.recordRetryFailure(ctx, turnID, plan, attempt, maxAttempts, failure, retryable, nextAccountID, now)
+		if !retryable {
+			a.writeUpstreamFailure(w, failure)
+			return forwardResult{StatusCode: failure.StatusCode, ErrorCode: failure.ErrorCode, ErrorMessage: failure.ErrorMessage, StreamState: "error"}, plan, nil
+		}
+		span.AddEvent("retry.scheduled", eventAttrs(turnID, plan.LineageSessionID, plan.Account.AccountID, failure.StatusCode, failure.ErrorCode))
+		if a.cfg.RetryBackoff > 0 {
+			select {
+			case <-time.After(a.cfg.RetryBackoff):
+			case <-ctx.Done():
+				cancelFailure := upstreamFailure{StatusCode: http.StatusBadGateway, ErrorCode: "client_cancelled", ErrorMessage: ctx.Err().Error(), Retryable: false}
+				a.writeUpstreamFailure(w, cancelFailure)
+				return forwardResult{StatusCode: cancelFailure.StatusCode, ErrorCode: cancelFailure.ErrorCode, ErrorMessage: cancelFailure.ErrorMessage, StreamState: "error"}, plan, nil
+			}
+		}
+		plan = nextPlan
+		if err := a.sqlite.UpsertLineageBinding(ctx, plan.LineageSessionID, plan.Account, turnID, time.Now().UTC()); err != nil {
+			return forwardResult{}, plan, err
+		}
+	}
+	a.writeUpstreamFailure(w, lastFailure)
+	return forwardResult{StatusCode: lastFailure.StatusCode, ErrorCode: lastFailure.ErrorCode, ErrorMessage: lastFailure.ErrorMessage, StreamState: "error"}, plan, nil
+}
+
+func (a *App) forwardNonStreamingAttempt(ctx context.Context, r *http.Request, turnID string, plan routePlan, now time.Time) (upstreamSuccess, upstreamFailure, error) {
 	ctx, span := a.telemetry.Tracer.Start(r.Context(), "gateway.provider.invoke")
 	defer span.End()
 	upstreamURL := fmt.Sprintf("http://%s:%d/v1/responses", plan.Account.DownstreamHost, plan.Account.DownstreamPort)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(plan.ForwardBody))
 	if err != nil {
-		return forwardResult{}, err
+		return upstreamSuccess{}, upstreamFailure{}, err
 	}
 	copyHeaders(req.Header, r.Header)
 	a.telemetry.Metrics.UpstreamRequests.Add(ctx, 1, observability.AddAttrs(attribute.String("gateway.account.id", plan.Account.AccountID), attribute.String("gateway.route.mode", plan.Mode)))
@@ -281,42 +392,123 @@ func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, turnID, t
 		a.cooldownForStatus(ctx, plan.Account.AccountID, http.StatusBadGateway, "upstream_request_failed", now)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "upstream request failed")
-		_ = a.sqlite.InsertRoutingFailure(ctx, ids.New("failure"), turnID, plan.LineageSessionID, plan.Account.AccountID, "upstream_request_failed", err.Error(), http.StatusBadGateway, now)
-		writeJSONError(w, http.StatusBadGateway, "upstream_request_failed", err.Error())
-		return forwardResult{StatusCode: http.StatusBadGateway, ErrorCode: "upstream_request_failed", ErrorMessage: err.Error()}, nil
+		return upstreamSuccess{}, upstreamFailure{StatusCode: http.StatusBadGateway, ErrorCode: "upstream_request_failed", ErrorMessage: err.Error(), Retryable: true}, nil
 	}
 	defer resp.Body.Close()
 	defer a.telemetry.Metrics.UpstreamDuration.Record(ctx, observability.MsSince(start), observability.RecordAttrs(attribute.String("gateway.account.id", plan.Account.AccountID), attribute.String("gateway.route.mode", plan.Mode)))
 
-	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	if isStreamingRequest(plan.ForwardMap) {
-		res, err := a.forwardStreamingResponses(w, resp, ctx, turnID, plan, now)
-		if res.StatusCode >= 400 {
-			a.telemetry.Metrics.UpstreamFailures.Add(ctx, 1)
-		}
-		return res, err
-	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return forwardResult{}, err
+		a.telemetry.Metrics.UpstreamFailures.Add(ctx, 1)
+		a.cooldownForStatus(ctx, plan.Account.AccountID, http.StatusBadGateway, "upstream_read_failed", now)
+		return upstreamSuccess{}, upstreamFailure{StatusCode: http.StatusBadGateway, ErrorCode: "upstream_read_failed", ErrorMessage: err.Error(), Retryable: true}, nil
 	}
-	_, _ = w.Write(body)
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		a.telemetry.Metrics.UpstreamFailures.Add(ctx, 1)
+		a.cooldownForStatus(ctx, plan.Account.AccountID, http.StatusBadGateway, "invalid_upstream_json", now)
+		return upstreamSuccess{}, upstreamFailure{StatusCode: http.StatusBadGateway, ErrorCode: "invalid_upstream_json", ErrorMessage: bodySnippet(body), Body: body, Header: resp.Header.Clone(), Retryable: true}, nil
+	}
 	if resp.StatusCode >= 400 {
 		a.telemetry.Metrics.UpstreamFailures.Add(ctx, 1)
 		a.cooldownForStatus(ctx, plan.Account.AccountID, resp.StatusCode, "upstream_rejected", now)
-		_ = a.sqlite.InsertRoutingFailure(ctx, ids.New("failure"), turnID, plan.LineageSessionID, plan.Account.AccountID, "upstream_rejected", string(body), resp.StatusCode, now)
-		return forwardResult{StatusCode: resp.StatusCode, ErrorCode: "upstream_rejected", ErrorMessage: string(body)}, nil
+		return upstreamSuccess{}, upstreamFailure{StatusCode: resp.StatusCode, ErrorCode: "upstream_rejected", ErrorMessage: bodySnippet(body), Header: resp.Header.Clone(), Body: body, Retryable: isRetryableStatus(resp.StatusCode), PassThrough: true}, nil
 	}
-	responseItems := responses.ResponseItems(mustParseMap(body))
-	if err := a.upsertResponseCarriers(ctx, turnID, plan, now, extractResponseCarriers(body)); err != nil {
-		a.logger.Error("upsert carrier bindings", logging.Err(err), logging.String("turn_id", turnID))
+	return upstreamSuccess{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: body, Raw: raw, ResponseItems: responses.ResponseItems(raw)}, upstreamFailure{}, nil
+}
+
+func (a *App) forwardStreamingWithRetry(w http.ResponseWriter, r *http.Request, turnID string, plan routePlan, now time.Time) (forwardResult, routePlan, error) {
+	ctx := r.Context()
+	maxAttempts := a.retryMaxAttempts()
+	excluded := map[string]struct{}{}
+	var lastFailure upstreamFailure
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		result, failure, wrote, err := a.forwardStreamingAttempt(w, r, turnID, plan, now)
+		if err != nil {
+			return forwardResult{}, plan, err
+		}
+		if failure.ErrorCode == "" {
+			return result, plan, nil
+		}
+		lastFailure = failure
+		excluded[plan.Account.AccountID] = struct{}{}
+		retryable := !wrote && failure.Retryable && attempt < maxAttempts
+		var nextPlan routePlan
+		if retryable {
+			var ok bool
+			var err error
+			nextPlan, ok, err = a.nextRetryPlan(ctx, plan, excluded, failure, now)
+			if err != nil {
+				return forwardResult{}, plan, err
+			}
+			retryable = ok
+		}
+		nextAccountID := ""
+		if retryable {
+			nextAccountID = nextPlan.Account.AccountID
+		}
+		a.recordRetryFailure(ctx, turnID, plan, attempt, maxAttempts, failure, retryable, nextAccountID, now)
+		if !retryable {
+			if !wrote {
+				a.writeUpstreamFailure(w, failure)
+			}
+			return forwardResult{StatusCode: failure.StatusCode, ErrorCode: failure.ErrorCode, ErrorMessage: failure.ErrorMessage, StreamState: "error"}, plan, nil
+		}
+		if a.cfg.RetryBackoff > 0 {
+			select {
+			case <-time.After(a.cfg.RetryBackoff):
+			case <-ctx.Done():
+				cancelFailure := upstreamFailure{StatusCode: http.StatusBadGateway, ErrorCode: "client_cancelled", ErrorMessage: ctx.Err().Error(), Retryable: false}
+				a.writeUpstreamFailure(w, cancelFailure)
+				return forwardResult{StatusCode: cancelFailure.StatusCode, ErrorCode: cancelFailure.ErrorCode, ErrorMessage: cancelFailure.ErrorMessage, StreamState: "error"}, plan, nil
+			}
+		}
+		plan = nextPlan
+		if err := a.sqlite.UpsertLineageBinding(ctx, plan.LineageSessionID, plan.Account, turnID, time.Now().UTC()); err != nil {
+			return forwardResult{}, plan, err
+		}
 	}
-	if plan.Mode == "replay" {
-		_ = a.sqlite.InsertReplayEvent(ctx, ids.New("replay"), turnID, turnID, plan.LineageSessionID, "", plan.Account.AccountID, plan.ReasonCode, strings.Join(plan.RemovedCarrierKinds, ","), plan.RemovedCarrierCount, now)
-		span.AddEvent("replay.completed", eventAttrs(turnID, plan.LineageSessionID, plan.Account.AccountID, resp.StatusCode, plan.ReasonCode))
+	a.writeUpstreamFailure(w, lastFailure)
+	return forwardResult{StatusCode: lastFailure.StatusCode, ErrorCode: lastFailure.ErrorCode, ErrorMessage: lastFailure.ErrorMessage, StreamState: "error"}, plan, nil
+}
+
+func (a *App) forwardStreamingAttempt(w http.ResponseWriter, r *http.Request, turnID string, plan routePlan, now time.Time) (forwardResult, upstreamFailure, bool, error) {
+	ctx, span := a.telemetry.Tracer.Start(r.Context(), "gateway.provider.invoke")
+	defer span.End()
+	upstreamURL := fmt.Sprintf("http://%s:%d/v1/responses", plan.Account.DownstreamHost, plan.Account.DownstreamPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(plan.ForwardBody))
+	if err != nil {
+		return forwardResult{}, upstreamFailure{}, false, err
 	}
-	return forwardResult{StatusCode: resp.StatusCode, ResponseItems: responseItems, StreamState: "completed"}, nil
+	copyHeaders(req.Header, r.Header)
+	a.telemetry.Metrics.UpstreamRequests.Add(ctx, 1, observability.AddAttrs(attribute.String("gateway.account.id", plan.Account.AccountID), attribute.String("gateway.route.mode", plan.Mode)))
+	start := time.Now()
+	resp, err := a.client.Do(req)
+	if err != nil {
+		a.telemetry.Metrics.UpstreamFailures.Add(ctx, 1)
+		a.cooldownForStatus(ctx, plan.Account.AccountID, http.StatusBadGateway, "upstream_request_failed", now)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "upstream request failed")
+		return forwardResult{}, upstreamFailure{StatusCode: http.StatusBadGateway, ErrorCode: "upstream_request_failed", ErrorMessage: err.Error(), Retryable: true}, false, nil
+	}
+	defer resp.Body.Close()
+	defer a.telemetry.Metrics.UpstreamDuration.Record(ctx, observability.MsSince(start), observability.RecordAttrs(attribute.String("gateway.account.id", plan.Account.AccountID), attribute.String("gateway.route.mode", plan.Mode)))
+	if isRetryableStatus(resp.StatusCode) {
+		body, _ := io.ReadAll(resp.Body)
+		a.telemetry.Metrics.UpstreamFailures.Add(ctx, 1)
+		a.cooldownForStatus(ctx, plan.Account.AccountID, resp.StatusCode, "upstream_rejected", now)
+		return forwardResult{}, upstreamFailure{StatusCode: resp.StatusCode, ErrorCode: "upstream_rejected", ErrorMessage: bodySnippet(body), Header: resp.Header.Clone(), Body: body, Retryable: true, PassThrough: true}, false, nil
+	}
+	copyHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	result, err := a.forwardStreamingResponses(w, resp, ctx, turnID, plan, now)
+	if result.StatusCode >= 400 {
+		a.telemetry.Metrics.UpstreamFailures.Add(ctx, 1)
+	}
+	if result.ErrorCode != "" {
+		return result, upstreamFailure{StatusCode: result.StatusCode, ErrorCode: result.ErrorCode, ErrorMessage: result.ErrorMessage, Retryable: false}, true, err
+	}
+	return result, upstreamFailure{}, true, err
 }
 
 func (a *App) forwardStreamingResponses(w http.ResponseWriter, resp *http.Response, ctx context.Context, turnID string, plan routePlan, now time.Time) (forwardResult, error) {
@@ -362,11 +554,144 @@ func (a *App) forwardStreamingResponses(w http.ResponseWriter, resp *http.Respon
 
 func (a *App) cooldownForStatus(ctx context.Context, accountID string, status int, reason string, now time.Time) {
 	switch status {
-	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable:
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		until := now.Add(5 * time.Minute)
 		if err := a.sqlite.CooldownAccount(ctx, accountID, fmt.Sprintf("%s_%d", reason, status), until, now); err != nil {
 			a.logger.Error("cooldown account", logging.Err(err), logging.String("account_id", accountID), logging.Int64("http_status", int64(status)))
 		}
+	}
+}
+
+func (a *App) retryMaxAttempts() int {
+	if a.cfg.RetryMaxAttempts < 1 {
+		return 1
+	}
+	return a.cfg.RetryMaxAttempts
+}
+
+func (a *App) nextRetryPlan(ctx context.Context, plan routePlan, excluded map[string]struct{}, failure upstreamFailure, now time.Time) (routePlan, bool, error) {
+	if plan.Mode == "strict" {
+		if !a.cfg.StrictReplayRetry || !a.cfg.DefaultReplayEnabled {
+			return routePlan{}, false, nil
+		}
+		stripped, removedKinds, removedCount := responses.StripCarriers(plan.ForwardMap)
+		account, err := a.sqlite.SelectLeastActiveAccountExcluding(ctx, stringValue(plan.ForwardMap, "model"), now, excluded)
+		if errors.Is(err, sql.ErrNoRows) {
+			return routePlan{}, false, nil
+		}
+		if err != nil {
+			return routePlan{}, false, err
+		}
+		return routePlan{
+			Mode:                "replay",
+			ReasonCode:          "strict_owner_retry_replay",
+			ReasonDetail:        failure.ErrorCode,
+			Account:             account,
+			LineageSessionID:    ids.New("lineage"),
+			HasRealCarrier:      true,
+			CarrierKinds:        plan.CarrierKinds,
+			RemovedCarrierKinds: removedKinds,
+			RemovedCarrierCount: removedCount,
+			ForwardBody:         mustJSON(stripped),
+			ForwardMap:          stripped,
+		}, true, nil
+	}
+	account, err := a.sqlite.SelectLeastActiveAccountExcluding(ctx, stringValue(plan.ForwardMap, "model"), now, excluded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return routePlan{}, false, nil
+	}
+	if err != nil {
+		return routePlan{}, false, err
+	}
+	next := plan
+	next.Account = account
+	next.ForwardBody = mustJSON(plan.ForwardMap)
+	return next, true, nil
+}
+
+func (a *App) recordRetryFailure(ctx context.Context, turnID string, plan routePlan, attempt, maxAttempts int, failure upstreamFailure, retryable bool, nextAccountID string, now time.Time) {
+	_ = a.sqlite.InsertRoutingFailure(ctx, ids.New("failure"), turnID, plan.LineageSessionID, plan.Account.AccountID, failure.ErrorCode, failure.ErrorMessage, failure.StatusCode, now)
+	_ = a.sqlite.InsertRetryAttempt(ctx, sqlitestore.RetryAttempt{
+		RetryAttemptID:   ids.New("retry"),
+		TurnID:           turnID,
+		LineageSessionID: plan.LineageSessionID,
+		Attempt:          attempt,
+		MaxAttempts:      maxAttempts,
+		AccountID:        plan.Account.AccountID,
+		RouteMode:        plan.Mode,
+		ReasonCode:       failure.ErrorCode,
+		ReasonDetail:     failure.ErrorMessage,
+		HTTPStatus:       failure.StatusCode,
+		Retryable:        retryable,
+		NextAccountID:    nextAccountID,
+		CreatedAt:        now,
+	})
+	a.telemetry.Metrics.RetryAttempts.Add(ctx, 1, observability.AddAttrs(
+		attribute.String("gateway.account.id", plan.Account.AccountID),
+		attribute.String("gateway.route.mode", plan.Mode),
+		attribute.String("gateway.retry.reason_code", failure.ErrorCode),
+		attribute.Bool("gateway.retry.retryable", retryable),
+	))
+	a.logger.Info("upstream attempt failed",
+		logging.String("turn_id", turnID),
+		logging.String("lineage_session_id", plan.LineageSessionID),
+		logging.String("account_id", plan.Account.AccountID),
+		logging.String("reason_code", failure.ErrorCode),
+		logging.Int64("http_status", int64(failure.StatusCode)),
+		logging.Int64("attempt", int64(attempt)),
+		logging.Int64("max_attempts", int64(maxAttempts)),
+		logging.Bool("retryable", retryable),
+		logging.String("next_account_id", nextAccountID),
+	)
+}
+
+func (a *App) writeUpstreamFailure(w http.ResponseWriter, failure upstreamFailure) {
+	if failure.PassThrough {
+		copyHeaders(w.Header(), failure.Header)
+		w.WriteHeader(failure.StatusCode)
+		_, _ = w.Write(failure.Body)
+		return
+	}
+	status := failure.StatusCode
+	if status == 0 {
+		status = http.StatusBadGateway
+	}
+	writeJSONError(w, status, failure.ErrorCode, failure.ErrorMessage)
+}
+
+func isRetryableStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func bodySnippet(body []byte) string {
+	const max = 2048
+	s := strings.TrimSpace(string(body))
+	if len(s) > max {
+		return s[:max]
+	}
+	return s
+}
+
+func turnMetaFromPlan(turnID string, plan routePlan) sqlitestore.TurnMeta {
+	return sqlitestore.TurnMeta{
+		TurnID:              turnID,
+		LineageSessionID:    plan.LineageSessionID,
+		LineageGeneration:   plan.LineageGeneration,
+		RouteMode:           plan.Mode,
+		Model:               stringValue(plan.ForwardMap, "model"),
+		AccountID:           plan.Account.AccountID,
+		DownstreamHost:      plan.Account.DownstreamHost,
+		DownstreamPort:      plan.Account.DownstreamPort,
+		HasRealCarrier:      plan.HasRealCarrier,
+		CarrierKinds:        strings.Join(plan.CarrierKinds, ","),
+		CarrierRemoved:      plan.RemovedCarrierCount > 0,
+		RemovedCarrierKinds: strings.Join(plan.RemovedCarrierKinds, ","),
+		RemovedCarrierCount: plan.RemovedCarrierCount,
 	}
 }
 
